@@ -92,6 +92,69 @@ def _core_starters_filled(state: DraftState, team_idx: int) -> bool:
     return have >= needed
 
 
+def _picks_remaining_for_team(state: DraftState, team_idx: int) -> int:
+    """
+    Remaining total picks this team will have (including the one on the clock)
+    based on roster rules: total slots = sum(starters) + bench.
+    """
+    rules = state.league.rules
+    total_slots = int(sum(rules.starters.values()) + rules.bench)
+    current = len(state.rosters[team_idx].players)
+    return max(0, total_slots - current)
+
+
+def _required_starter_needs(state: DraftState, team_idx: int) -> tuple[dict[Position, int], int]:
+    """
+    Return (dedicated_needs, flex_need_remaining) as INTEGERS.
+    - dedicated_needs[p]: number of starting slots still to fill at position p (QB,RB,WR,TE,DST,K).
+    - flex_need_remaining: number of FLEX starters still to fill after counting current excess
+      of FLEX-eligible players above their dedicated starters.
+    """
+    rules = state.league.rules
+    roster = state.rosters[team_idx]
+
+    # Dedicated needs
+    need: dict[Position, int] = {p: 0 for p in (Position.QB, Position.RB, Position.WR, Position.TE, Position.DST, Position.K)}
+    for p in need.keys():
+        need[p] = max(0, int(rules.starter_slots_for(p)) - roster.count(p))
+
+    # FLEX remaining
+    flex_total = int(rules.starters.get("FLEX", 0))
+    if flex_total <= 0:
+        flex_left = 0
+    else:
+        rb_excess = max(0, roster.count(Position.RB) - int(rules.starter_slots_for(Position.RB)))
+        wr_excess = max(0, roster.count(Position.WR) - int(rules.starter_slots_for(Position.WR)))
+        te_excess = max(0, roster.count(Position.TE) - int(rules.starter_slots_for(Position.TE)))
+        flex_left = max(0, flex_total - (rb_excess + wr_excess + te_excess))
+
+    return need, flex_left
+
+
+def _would_pick_be_feasible(
+    state: DraftState,
+    team_idx: int,
+    pick_pos: Position,
+) -> bool:
+    """
+    Feasibility check: if team_idx selects a player at position `pick_pos` now,
+    will they still be able to fill all REQUIRED starters with their remaining picks?
+    """
+    L = _picks_remaining_for_team(state, team_idx)      # includes this pick
+    need, flex_left = _required_starter_needs(state, team_idx)
+
+    # Apply the hypothetical pick to needs (greedy: reduce dedicated; else reduce FLEX if eligible)
+    if pick_pos in need and need[pick_pos] > 0:
+        need[pick_pos] -= 1
+    elif pick_pos in state.league.rules.flex_positions and flex_left > 0:
+        flex_left -= 1
+    # else: purely a bench/duplicate pick, no reduction to required needs
+
+    # Remaining required after taking this pick must fit into remaining picks (L-1)
+    req_after = int(sum(need.values()) + flex_left)
+    return req_after <= max(0, L - 1)
+
+
 # -----------------------------
 # DraftEngine
 # -----------------------------
@@ -225,13 +288,14 @@ class DraftEngine:
 
         return best, per_pos_debug_for_best, top5
 
+
     def _feasible_candidates_for_team(self, state: DraftState, team_idx: int) -> List:
         """
-        Build the candidate pool for the team on the clock:
-        - Must be available (not drafted).
-        - Respect per-position caps if configured.
-        - Optionally gate K/DST until core starters filled (reuse opponent kdst_gate flag).
-        - Reduce to top N by a simple baseline score before deep evaluation, for speed.
+        Build the candidate pool for the team on the clock, with HARD FEASIBILITY:
+        - A candidate is kept only if, after taking them, the team can still fill
+        all REQUIRED starters with its remaining picks.
+        - Also applies position caps and early K/DST gate.
+        - Pre-trims by a fast baseline score to limit evaluation cost.
         """
         cfg = self.config
         rules = cfg.league.rules
@@ -241,7 +305,12 @@ class DraftEngine:
         roster = state.rosters[team_idx]
         taken = state.drafted_uids
 
-        # Collect available players, apply caps & gates
+        # Compute must-pick window flag (if remaining picks == required still to fill)
+        need, flex_left = _required_starter_needs(state, team_idx)
+        L = _picks_remaining_for_team(state, team_idx)
+        req_total = int(sum(need.values()) + flex_left)
+        must_pick_window = (L == req_total)
+
         pool_list = []
         for uid, pl in self.pool.by_uid.items():
             if uid in taken:
@@ -252,25 +321,36 @@ class DraftEngine:
             if cap is not None and roster.count(pl.position) >= cap:
                 continue
 
-            # Gate K/DST if core starters not yet filled
+            # Early K/DST gate
             if gate_kdst and pl.position in (Position.K, Position.DST) and not _core_starters_filled(state, team_idx):
+                # still allow if we're in a must-pick window that requires K/DST
+                if not must_pick_window or need.get(pl.position, 0) <= 0:
+                    continue
+
+            # HARD FEASIBILITY: skip if taking this player would make it impossible
+            # to finish required slots in remaining picks.
+            if not _would_pick_be_feasible(state, team_idx, pl.position):
                 continue
+
+            # If we are in a must-pick window, only allow picks that reduce required needs
+            # (i.e., dedicated need at that position > 0, or FLEX-eligible when flex_left > 0)
+            if must_pick_window:
+                reduces_dedicated = (pl.position in need and need[pl.position] > 0)
+                reduces_flex = (pl.position in rules.flex_positions and flex_left > 0)
+                if not (reduces_dedicated or reduces_flex):
+                    continue
 
             pool_list.append(pl)
 
         if not pool_list:
             return []
 
-        # Pre-trim the list to candidate_pool_size by a fast baseline score (mu or vor)
+        # Pre-trim by a fast baseline score (μ with tiny ADP nudge)
         def baseline(pl):
             mu = float(pl.proj.mu or 0.0)
-            vor = pl.proj.vor
-            base = float(vor) if (cfg.engine.value_model.use_vor and vor is not None) else mu
-            # Nudge by ADP (earlier ADP slightly favored to break ties, but tiny)
-            adp_bonus = 0.0
-            if pl.proj.adp is not None:
-                adp_bonus = 0.001 / max(1.0, pl.proj.adp)
-            return base + adp_bonus
+            adp = pl.proj.adp
+            adp_bonus = (0.001 / max(1.0, adp)) if adp is not None else 0.0
+            return mu + adp_bonus
 
         pool_list.sort(key=baseline, reverse=True)
         return pool_list[: int(cfg.engine.candidate_pool_size)]
