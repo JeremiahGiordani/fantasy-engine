@@ -1,468 +1,306 @@
+# src/fantasy/draft_engine.py
 from __future__ import annotations
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Set, Tuple
-import copy
-import numpy as np
-import pandas as pd
-import copy
-import math
+
+"""
+DraftEngine: orchestrates candidate evaluation, one-step lookahead, and pick execution.
+
+Responsibilities
+---------------
+- Build the feasible candidate set for the team on the clock (respecting caps/gates).
+- For each candidate a:
+    Δ_now(a) = J(R ∪ {a}) - J(R)
+    Δ_next^(k)(a) ≈ max_p  m̃_p^(a)(r_p^(a)),  with  r_p^(a) = 1 + 1{p=π(a)} + λ_p
+  where λ_p are expected removals by position between now and the team's next pick.
+- Choose the candidate with maximal Utility = Δ_now + Δ_next.
+- Apply the pick to the DraftState and print diagnostics per verbosity level.
+
+This engine assumes:
+- PlayerPool contains all players (by_uid) and can filter availability via state.drafted_uids.
+- models.py, marginal_value.py, opponent_behavior.py are present as designed.
+
+Verbosity
+---------
+- 0 (QUIET): no printing
+- 1 (PICKS): one line per pick with key numbers
+- 2 (DEBUG): plus top-5 candidate table and next-turn per-position breakdown (values and ranks)
+"""
+
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
+
+from .models import (
+    DraftEngineConfig,
+    DraftState,
+    PlayerPool,
+    Position,
+    Verbosity,
+    CandidateRow,
+    NextTurnBreakdown,
+)
+from .marginal_value import (
+    delta_now_for_candidate,
+    top_marginals_by_position_after_pick,
+    interpolate_at_rank,
+    value_now_for_candidates,
+)
+from .opponent_behavior import position_probabilities_for_team
 
 
 # -----------------------------
-# Config + Roster
+# Helpers: snake math & gates
+# -----------------------------
+
+def team_on_the_clock_at(pick_number: int, league_size: int) -> int:
+    """Return team index on the clock at absolute pick_number (1-based)."""
+    n = league_size
+    r = (pick_number - 1) // n  # 0-based round
+    i = (pick_number - 1) % n   # 0-based within round, left-to-right
+    return i if (r % 2 == 0) else (n - 1 - i)
+
+
+def next_pick_index_for_team(current_pick: int, league_size: int, team_idx: int) -> int:
+    """
+    Return the next absolute pick index (> current_pick) where team_idx will draft.
+    Simple iteration is fine (n is small).
+    """
+    p = current_pick + 1
+    while True:
+        if team_on_the_clock_at(p, league_size) == team_idx:
+            return p
+        p += 1
+
+
+def _core_starters_filled(state: DraftState, team_idx: int) -> bool:
+    """Mirror of opponent_behavior._core_starters_filled for our own gating."""
+    rules = state.league.rules
+    roster = state.rosters[team_idx]
+    needed = rules.starters_required_non_kdst()
+
+    have = 0
+    have += min(roster.count(Position.QB), rules.starter_slots_for(Position.QB))
+    have += min(roster.count(Position.RB), rules.starter_slots_for(Position.RB))
+    have += min(roster.count(Position.WR), rules.starter_slots_for(Position.WR))
+    have += min(roster.count(Position.TE), rules.starter_slots_for(Position.TE))
+
+    flex_need = int(rules.starters.get("FLEX", 0))
+    if flex_need > 0:
+        rb_excess = max(0, roster.count(Position.RB) - rules.starter_slots_for(Position.RB))
+        wr_excess = max(0, roster.count(Position.WR) - rules.starter_slots_for(Position.WR))
+        te_excess = max(0, roster.count(Position.TE) - rules.starter_slots_for(Position.TE))
+        have += min(flex_need, rb_excess + wr_excess + te_excess)
+
+    return have >= needed
+
+
+# -----------------------------
+# DraftEngine
 # -----------------------------
 
 @dataclass
-class DraftConfig:
-    league_size: int                 # e.g., 6, 10, 12
-    starters: Dict[str, int]         # {"QB":1,"RB":2,"WR":2,"TE":1,"FLEX":1,"DST":1,"K":1}
-    bench: int                       # e.g., 7
-    flex_positions: Tuple[str, ...] = ("RB", "WR", "TE")
-    risk_lambda: float = 0.0         # risk penalty on "uncertainty" if points_vor not present
-    max_per_pos_softcap: Dict[str, int] = field(
-        default_factory=lambda: {"QB":2, "RB":7, "WR":8, "TE":2, "DST":1, "K":1}
-    )
+class DraftEngine:
+    config: DraftEngineConfig
+    pool: PlayerPool
 
-    def total_roster_slots(self) -> int:
-        return sum(self.starters.values()) + self.bench
+    # ---------- Public API ----------
 
+    def make_pick(self, state: DraftState) -> Optional[CandidateRow]:
+        """
+        Execute a pick for the team currently on the clock, mutating `state`.
+        Returns the chosen CandidateRow (or None if no feasible candidates).
+        """
+        team_idx = state.team_on_the_clock()
 
-@dataclass
-class Roster:
-    starters: Dict[str, int]
-    flex_positions: Tuple[str, ...]
-    bench_slots: int
-    counts: Dict[str, int] = field(default_factory=dict)
+        best_row, breakdown, top5 = self._recommend_for_team(state, team_idx)
+        if best_row is None:
+            if self.config.verbosity >= Verbosity.PICKS:
+                print(f"{state.pick_number:3d}. Team {team_idx} -> (no feasible candidates)")
+            state.advance_one_pick()
+            return None
 
-    def __post_init__(self):
-        for p in ["QB", "RB", "WR", "TE", "DST", "K"]:
-            self.counts.setdefault(p, 0)
+        # Apply pick
+        chosen_uid = best_row.uid
+        chosen_player = self.pool.by_uid[chosen_uid]
+        state.drafted_uids.add(chosen_uid)
+        state.rosters[team_idx].add(chosen_player.position, chosen_uid)
 
-    def current_starter_need(self, pos: str) -> int:
-        return max(0, self.starters.get(pos, 0) - self.counts.get(pos, 0))
+        # Print
+        if self.config.verbosity >= Verbosity.PICKS:
+            print(
+                f"{state.pick_number:3d}. Team {team_idx} -> "
+                f"{chosen_player.name} ({chosen_player.position.value}, {chosen_player.team or 'FA'})  "
+                f"[value={best_row.value_now:.2f}, expNext={best_row.exp_next:.2f}, "
+                f"util={best_row.utility:.2f}, ADP={best_row.adp if best_row.adp is not None else 'NA'}]"
+            )
 
-    def total_flex_need(self) -> int:
-        return max(0, self.starters.get("FLEX", 0))
-
-    def add(self, pos: str):
-        self.counts[pos] = self.counts.get(pos, 0) + 1
-
-    def need_factor(self, pos: str) -> float:
-        w = 1.0 + 0.75 * self.current_starter_need(pos)
-        if pos in self.flex_positions and self.total_flex_need() > 0:
-            w += 0.5
-        if pos in ("K", "DST") and sum(self.counts.values()) < 8:
-            w *= 0.6
-        return max(0.15, w)
-
-
-# -----------------------------
-# Draft State (snake-aware)
-# -----------------------------
-
-@dataclass
-class DraftState:
-    cfg: DraftConfig
-    rosters: List[Roster] = field(default_factory=list)
-    drafted_ids: Set[str] = field(default_factory=set)
-    pick_number: int = 1  # global pick number (1-indexed)
-
-    def __post_init__(self):
-        if not self.rosters:
-            self.rosters = [
-                Roster(
-                    starters=copy.deepcopy(self.cfg.starters),
-                    flex_positions=self.cfg.flex_positions,
-                    bench_slots=self.cfg.bench,
+        if self.config.verbosity >= Verbosity.DEBUG and top5:
+            print("    Top candidates:")
+            for r in top5:
+                print(
+                    f"      - {r.name:20s} {r.position.value:>3s}  "
+                    f"Δ_now={r.value_now:7.2f}  Δ_next={r.exp_next:7.2f}  "
+                    f"U={r.utility:7.2f}  ADP={r.adp if r.adp is not None else 'NA'}"
                 )
-                for _ in range(self.cfg.league_size)
-            ]
+            if breakdown is not None:
+                print("    Next-turn breakdown by position:")
+                for p in sorted(breakdown.exp_by_pos.keys(), key=lambda x: x.value):
+                    val = breakdown.exp_by_pos[p]
+                    rnk = breakdown.rank_by_pos[p]
+                    print(f"      * {p.value:>3s}: exp={val:7.2f}, r_p(a)={rnk:.2f}")
 
-    def team_on_the_clock(self) -> int:
-        N = self.cfg.league_size
-        r = (self.pick_number - 1) // N  # 0-based round
-        i = (self.pick_number - 1) % N   # 0-based index within round
-        return i if r % 2 == 0 else (N - 1 - i)
+        state.advance_one_pick()
+        return best_row
 
-    def next_pick_distance_to_team(self, team_idx: int) -> int:
-        """How many picks until 'team_idx' next selects (excluding current pick)."""
-        N = self.cfg.league_size
-        dist, pn = 0, self.pick_number + 1
-        while True:
-            r = (pn - 1) // N
-            i = (pn - 1) % N
-            team = i if r % 2 == 0 else (N - 1 - i)
-            if team == team_idx:
-                return dist
-            pn += 1
-            dist += 1
+    # ---------- Internals ----------
 
-    def advance_one_pick(self):
-        self.pick_number += 1
+    def _recommend_for_team(
+        self,
+        state: DraftState,
+        team_idx: int,
+    ) -> Tuple[Optional[CandidateRow], Optional[NextTurnBreakdown], List[CandidateRow]]:
+        """
+        Core evaluation: compute Utility = Δ_now(a) + Δ_next^(k)(a) for feasible candidates,
+        return the best, plus optional breakdown and a top-5 list for verbose printing.
+        """
+        candidates = self._feasible_candidates_for_team(state, team_idx)
+        if not candidates:
+            return None, None, []
 
+        # Expected removals λ_p between now and our next pick
+        lam = self._expected_removals_between_our_picks(state, team_idx)
 
-# -----------------------------
-# Draft Assistant
-# -----------------------------
-class DraftAssistant:
-    """
-    Position-driven, snake-aware draft assistant:
-    - Recomputes VOR to your league (starters + FLEX).
-    - Models opponents at the POSITION level (no ADP): each upcoming team
-      has a probability over {QB,RB,WR,TE,K,DST} based on roster needs and
-      the top shaped value available at each position for that team.
-    - Sums those probabilities across upcoming picks to get expected counts
-      taken per position; uses them to compute expected replacement at your
-      next pick; chooses the candidate maximizing value_now + expected_best_next.
-    - Filters out IDP positions (DL/LB/DB) and enforces simple hard caps.
-    """
+        # Evaluate candidates
+        rows: List[CandidateRow] = []
+        per_pos_debug_for_best: Optional[NextTurnBreakdown] = None
+        best: Optional[CandidateRow] = None
 
-    # Allowed fantasy positions (exclude IDP)
-    ALLOWED_POS = {"QB", "RB", "WR", "TE", "K", "DST"}
+        # Precompute Δ_now for speed (vectorized-ish)
+        delta_now_map = value_now_for_candidates(state, self.pool, self.config, team_idx, [p.uid for p in candidates])
 
-    # Simple hard caps to prevent nonsense like 6 kickers / 3 DST.
-    # You can tune these or make them configurable later.
-    HARD_CAP = {"K": 1, "DST": 1}
+        for pl in candidates:
+            dn = delta_now_map.get(pl.uid, 0.0)
 
-    # Softmax temperature for converting position scores -> probabilities.
-    # Lower = more peaky (teams behave more deterministically).
-    POS_SOFTMAX_K = 0.05
-
-    def __init__(self, cfg: DraftConfig, projections: pd.DataFrame, recompute_vor: bool = True):
-        self.cfg = cfg
-        self.df = self._prepare_df(projections, recompute_vor=recompute_vor)
-
-    # ---------- Prep / VOR (league-aware) ----------
-
-    @staticmethod
-    def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
-        d = df.copy()
-
-        # Normalize column names
-        if "pos" in d.columns and "position" not in d.columns:
-            d.rename(columns={"pos": "position"}, inplace=True)
-
-        # Filter out non-fantasy positions (IDP etc.)
-        if "position" in d.columns:
-            d = d[d["position"].isin(DraftAssistant.ALLOWED_POS)].copy()
-
-        # Stable id if missing
-        if "id" not in d.columns:
-            d["id"] = (
-                d["player"].astype(str).str.strip()
-                + "|"
-                + d["team"].astype(str).str.strip()
-                + "|"
-                + d["position"].astype(str).str.strip()
+            # Build m_p^{(a)} lists after taking a = pl
+            m_by_pos, _ = top_marginals_by_position_after_pick(
+                state=state,
+                pool=self.pool,
+                config=self.config,
+                team_idx=team_idx,
+                a_uid=pl.uid,
+                per_pos_k=5,  # enough for interpolation around r in typical cases
             )
 
-        # Ensure points exist for VOR recompute
-        if "points" not in d.columns:
-            raise ValueError("Expected a 'points' column in projections for VOR recomputation.")
-        d["points"] = d["points"].astype(float)
+            # Compute r_p^(a) and interpolated expected next values by position
+            rank_by_pos: Dict[Position, float] = {}
+            exp_by_pos: Dict[Position, float] = {}
+            for p, vals in m_by_pos.items():
+                rp = 1.0 + (1.0 if p == pl.position else 0.0) + lam.get(p, 0.0)
+                rank_by_pos[p] = rp
+                exp_by_pos[p] = interpolate_at_rank(vals, rp) if vals else 0.0
 
-        # If ADP exists, we keep it only for display; logic below doesn't use it.
-        if "adp" in d.columns:
-            d["adp"] = d["adp"].astype(float)
+            dnext = max(exp_by_pos.values()) if exp_by_pos else 0.0
+            util = dn + dnext
 
-        return d
-
-    def _compute_replacement_points(self, d: pd.DataFrame) -> dict:
-        """
-        Compute replacement points per position for THIS league by filling
-        dedicated starters and allocating FLEX greedily across RB/WR/TE.
-        """
-        N = self.cfg.league_size
-        starters = self.cfg.starters
-        flex_elig = set(self.cfg.flex_positions)
-
-        # Build per-position sorted points (desc)
-        points_by_pos = {}
-        for p in d["position"].unique():
-            pts = (
-                d.loc[d["position"] == p, "points"]
-                .astype(float)
-                .fillna(0.0)
-                .sort_values(ascending=False)
-                .to_list()
+            row = CandidateRow(
+                uid=pl.uid,
+                name=pl.name,
+                team=pl.team,
+                position=pl.position,
+                value_now=dn,
+                exp_next=dnext,
+                utility=util,
+                adp=pl.proj.adp,
+                mu=pl.proj.mu,
+                vor=pl.proj.vor,
             )
-            points_by_pos[p] = pts
+            rows.append(row)
 
-        # How many starters used per position (dedicated first)
-        used = {p: 0 for p in points_by_pos.keys()}
-        for p in points_by_pos.keys():
-            need = N * starters.get(p, 0)
-            used[p] = min(need, len(points_by_pos[p]))
+            if (best is None) or (row.utility > best.utility):
+                best = row
+                if self.config.verbosity >= Verbosity.DEBUG:
+                    per_pos_debug_for_best = NextTurnBreakdown(exp_by_pos=exp_by_pos, rank_by_pos=rank_by_pos)
 
-        # Allocate FLEX across RB/WR/TE greedily
-        total_flex = N * starters.get("FLEX", 0)
+        # Sort for top-5 printing
+        rows.sort(key=lambda r: r.utility, reverse=True)
+        top5 = rows[:5]
 
-        def next_best():
-            best_pos, best_pts = None, -1.0
-            for p in flex_elig:
-                lst = points_by_pos.get(p, [])
-                idx = used.get(p, 0)
-                if idx < len(lst):
-                    pts = lst[idx]
-                    if pts > best_pts:
-                        best_pts, best_pos = pts, p
-            return best_pos, best_pts
+        return best, per_pos_debug_for_best, top5
 
-        for _ in range(total_flex):
-            p, pts = next_best()
-            if p is None:
-                break
-            used[p] = used.get(p, 0) + 1
-
-        # Replacement = next available after starters+flex
-        replacement_points = {}
-        for p, lst in points_by_pos.items():
-            idx = used.get(p, 0)
-            replacement_points[p] = float(lst[idx]) if idx < len(lst) else 0.0
-
-        return replacement_points
-
-    def _prepare_df(self, df: pd.DataFrame, recompute_vor: bool) -> pd.DataFrame:
-        d = self._normalize_columns(df)
-
-        if recompute_vor:
-            repl = self._compute_replacement_points(d)
-            d["vor_league"] = d.apply(
-                lambda r: float(r["points"]) - float(repl.get(r["position"], 0.0)), axis=1
-            )
-            d["base_value"] = d["vor_league"]
-        else:
-            if "points_vor" in d.columns:
-                d["base_value"] = d["points_vor"].astype(float)
-            else:
-                lam = self.cfg.risk_lambda
-                d["base_value"] = d["points"].astype(float) - lam * d.get("uncertainty", 0.0).astype(float)
-
-        d["value"] = d["base_value"]
-        return d
-
-    # ---------- Roster shaping (your team & opponents) ----------
-
-    def _shape_value_for_roster(self, row: pd.Series, roster: Roster) -> float:
+    def _feasible_candidates_for_team(self, state: DraftState, team_idx: int) -> List:
         """
-        Reuse the same shaping for you and opponents:
-        - +10% per open dedicated starter at that position
-        - +5% if FLEX exists and pos is FLEX-eligible
-        - Early de-emphasis of K/DST
+        Build the candidate pool for the team on the clock:
+        - Must be available (not drafted).
+        - Respect per-position caps if configured.
+        - Optionally gate K/DST until core starters filled (reuse opponent kdst_gate flag).
+        - Reduce to top N by a simple baseline score before deep evaluation, for speed.
         """
-        pos = row["position"]
-        v = float(row["base_value"])
+        cfg = self.config
+        rules = cfg.league.rules
+        cap_for = cfg.cap_for
+        gate_kdst = cfg.engine.opponent_model.kdst_gate
 
-        need = roster.current_starter_need(pos)
-        if need > 0:
-            v *= (1.0 + 0.10 * need)
+        roster = state.rosters[team_idx]
+        taken = state.drafted_uids
 
-        if pos in self.cfg.flex_positions and self.cfg.starters.get("FLEX", 0) > 0:
-            v *= 1.05
-
-        total_taken = sum(roster.counts.values())
-        starters_total = sum(self.cfg.starters.values())
-        if pos in ("K", "DST") and total_taken < max(6, starters_total - 2):
-            v *= 0.65
-
-        return v
-
-    # ---------- Position-level probabilities for an opponent team ----------
-
-    def _pos_probs_for_team(self, pool: pd.DataFrame, roster: Roster) -> dict:
-        """
-        Return a dict pos->prob for a single upcoming team:
-        prob(pos) ∝ exp(k * score_pos), where score_pos = top_shaped_value_at_pos * need_weight,
-        with hard caps enforced and normalized over allowed positions.
-        """
-        k = self.POS_SOFTMAX_K
-        scores = {}
-
-        # Enforce simple hard caps (e.g., no more than 1 K or 1 DST drafted per team)
-        def at_hard_cap(p: str) -> bool:
-            cap = self.HARD_CAP.get(p, None)
-            return (cap is not None) and (roster.counts.get(p, 0) >= cap)
-
-        for pos in self.ALLOWED_POS:
-            if at_hard_cap(pos):
-                continue  # cannot pick more of this position
-
-            # Top shaped value available at this position for THIS roster
-            pool_pos = pool[pool["position"] == pos]
-            if pool_pos.empty:
+        # Collect available players, apply caps & gates
+        pool_list = []
+        for uid, pl in self.pool.by_uid.items():
+            if uid in taken:
                 continue
 
-            shaped_vals = pool_pos.apply(lambda r: self._shape_value_for_roster(r, roster), axis=1)
-            top_val = float(shaped_vals.max())
+            # Cap per position
+            cap = cap_for(pl.position)
+            if cap is not None and roster.count(pl.position) >= cap:
+                continue
 
-            # Need weight: 1 + 0.75 per open dedicated starter at that pos
-            need_w = 1.0 + 0.75 * roster.current_starter_need(pos)
+            # Gate K/DST if core starters not yet filled
+            if gate_kdst and pl.position in (Position.K, Position.DST) and not _core_starters_filled(state, team_idx):
+                continue
 
-            # If FLEX remains and pos is FLEX-eligible, small bump
-            if pos in self.cfg.flex_positions and self.cfg.starters.get("FLEX", 0) > 0:
-                need_w *= 1.10
+            pool_list.append(pl)
 
-            score = top_val * need_w
-            if score > 0:
-                scores[pos] = score
+        if not pool_list:
+            return []
 
-        if not scores:
-            # fallback: uniform over any positions not hard-capped
-            elig = [p for p in self.ALLOWED_POS if not at_hard_cap(p)]
-            if not elig:
-                return {}
-            w = 1.0 / len(elig)
-            return {p: w for p in elig}
+        # Pre-trim the list to candidate_pool_size by a fast baseline score (mu or vor)
+        def baseline(pl):
+            mu = float(pl.proj.mu or 0.0)
+            vor = pl.proj.vor
+            base = float(vor) if (cfg.engine.value_model.use_vor and vor is not None) else mu
+            # Nudge by ADP (earlier ADP slightly favored to break ties, but tiny)
+            adp_bonus = 0.0
+            if pl.proj.adp is not None:
+                adp_bonus = 0.001 / max(1.0, pl.proj.adp)
+            return base + adp_bonus
 
-        # softmax to probabilities
-        max_s = max(scores.values())
-        # stabilize
-        weights = {p: math.exp(k * (s - max_s)) for p, s in scores.items()}
-        total_w = sum(weights.values())
-        return {p: (w / total_w) for p, w in weights.items()}
+        pool_list.sort(key=baseline, reverse=True)
+        return pool_list[: int(cfg.engine.candidate_pool_size)]
 
-    # ---------- Expected counts by position until next pick ----------
-
-    def _expected_counts_to_next(self, state: DraftState, pool: pd.DataFrame, my_team_idx: int) -> dict:
+    def _expected_removals_between_our_picks(self, state: DraftState, team_idx: int) -> Dict[Position, float]:
         """
-        Sum position probabilities across the specific sequence of teams who pick
-        before my_team_idx picks again.
+        Compute λ_p = expected number of players at position p removed between our
+        current pick and our next pick (exclusive of our own picks).
+        Sum P_t^{(q)}(p) across each opponent pick q in that span.
         """
-        N = self.cfg.league_size
-        counts = {p: 0.0 for p in self.ALLOWED_POS}
+        lam: Dict[Position, float] = {p: 0.0 for p in Position}
+        n = state.league.league_size
+        current_pick = state.pick_number
+        next_pick = next_pick_index_for_team(current_pick, n, team_idx)
 
-        pn = state.pick_number + 1
-        while True:
-            r = (pn - 1) // N
-            i = (pn - 1) % N
-            team = i if r % 2 == 0 else (N - 1 - i)
-            pn += 1
-            if team == my_team_idx:
-                break  # reached our next pick
+        # For each pick between (current_pick, next_pick), add that team's position probabilities
+        for q in range(current_pick + 1, next_pick):
+            opp_team = team_on_the_clock_at(q, n)
+            # Skip our own team defensively
+            if opp_team == team_idx:
+                continue
 
-            roster = state.rosters[team]
-            probs = self._pos_probs_for_team(pool, roster)
-            for p, prob in probs.items():
-                counts[p] += prob
+            probs = position_probabilities_for_team(
+                state=state,
+                pool=self.pool,
+                config=self.config,
+                team_idx=opp_team,
+                pick_index=q,
+            )
+            for p, pr in probs.items():
+                lam[p] += float(pr)
 
-        return counts  # expected (fractional) number taken per position
-
-    # ---------- Read expected replacement value after removing expected counts ----------
-
-    @staticmethod
-    def _expected_top_after_removals(values_desc: list, expected_removed: float) -> float:
-        """
-        Given a descending list of values and an expected number removed `x`,
-        return the expected new top value using linear interpolation between
-        floor(x) and ceil(x). Indexing is 0-based (remove x from the front).
-        """
-        if not values_desc:
-            return 0.0
-        n = len(values_desc)
-        x = max(0.0, min(float(expected_removed), float(n - 1)))
-        k = int(math.floor(x))
-        frac = x - k
-        i0 = min(k, n - 1)
-        i1 = min(k + 1, n - 1)
-        v0, v1 = values_desc[i0], values_desc[i1]
-        return (1.0 - frac) * v0 + frac * v1
-
-    # ---------- Public API: recommendation ----------
-
-    def recommend_for_team(self, state: DraftState, team_idx: int, top_k: int = 10) -> pd.DataFrame:
-        """
-        Pure position-probability lookahead (no ADP).
-        Utility(candidate) = shaped_value_now + expected_best_next_value,
-        where the expected next board is computed by removing the expected number
-        of players by position across the opponents who pick before us.
-        """
-        # Filter pool to exclude anything we've already hard-capped for *our* team
-        def my_hard_capped(pos: str) -> bool:
-            cap = self.HARD_CAP.get(pos, None)
-            return (cap is not None) and (state.rosters[team_idx].counts.get(pos, 0) >= cap)
-
-        pool = self.df[
-            (~self.df["id"].isin(state.drafted_ids))
-            & (self.df["position"].apply(lambda p: not my_hard_capped(p)))
-        ].copy()
-
-        my_roster = state.rosters[team_idx]
-
-        # Current shaped value for you (now)
-        pool["value_now"] = pool.apply(lambda r: self._shape_value_for_roster(r, my_roster), axis=1)
-
-        # Precompute per-position sorted value lists (desc)
-        values_by_pos = {}
-        for p in self.ALLOWED_POS:
-            vals = pool.loc[pool["position"] == p, "value_now"].astype(float).sort_values(ascending=False).tolist()
-            if vals:
-                values_by_pos[p] = vals
-
-        # Expected counts taken by others (position-level)
-        exp_counts = self._expected_counts_to_next(state, pool, my_team_idx=team_idx)
-
-        rows = []
-        # Consider a modest candidate frontier: top N overall by now-value
-        candidates = pool.sort_values("value_now", ascending=False).head(40)
-
-        for _, A in candidates.iterrows():
-            posA = A["position"]
-
-            # Build a temporary copy of per-position boards if we take A now:
-            # - Remove A from its position (approx: remove the top item)
-            # - Then remove expected counts exp_counts[p] for opponents (fractional)
-            vals_after = {}
-            for p, vals in values_by_pos.items():
-                if not vals:
-                    continue
-                list_copy = vals.copy()
-                if p == posA:
-                    # Remove one item from the top as a proxy for taking A
-                    if list_copy:
-                        list_copy.pop(0)
-                vals_after[p] = list_copy
-
-            # Compute expected top value at your next turn per position
-            expected_tops = {}
-            for p, lst in vals_after.items():
-                if not lst:
-                    expected_tops[p] = 0.0
-                    continue
-                removed = exp_counts.get(p, 0.0)
-                expected_tops[p] = self._expected_top_after_removals(lst, removed)
-
-            # Next-pick best we expect among all positions
-            exp_best_next = max(expected_tops.values()) if expected_tops else 0.0
-
-            utility = float(A["value_now"]) + float(exp_best_next)
-
-            rows.append({
-                "player": A["player"],
-                "team": A["team"],
-                "position": posA,
-                "value": round(float(A["value_now"]), 2),
-                "exp_next": round(float(exp_best_next), 2),
-                "utility": round(float(utility), 2),
-                "adp": A.get("adp", None),
-                "points": A.get("points", None),
-                "points_vor": A.get("points_vor", None),
-                "uncertainty": A.get("uncertainty", None),
-                "id": A["id"],
-            })
-
-        out = pd.DataFrame(rows).sort_values("utility", ascending=False).head(top_k)
-        return out[["player","team","position","value","exp_next","utility","adp","points","points_vor","uncertainty","id"]]
-
-    # ---------- Apply pick ----------
-
-    def apply_pick(self, state: DraftState, player_id: str):
-        """
-        Apply the current on-the-clock pick (whoever it is) to the shared state.
-        Enforces HARD_CAP for that team's roster simply by never recommending
-        over-cap positions; if a human forces a pick elsewhere, we still record it.
-        """
-        state.drafted_ids.add(player_id)
-        team = state.team_on_the_clock()
-        pos = self.df.loc[self.df["id"] == player_id, "position"].values[0]
-        state.rosters[team].add(pos)
-        state.advance_one_pick()
+        return lam
