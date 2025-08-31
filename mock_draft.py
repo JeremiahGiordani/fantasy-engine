@@ -44,10 +44,10 @@ from src.fantasy.draft_engine import DraftEngine
 # ===== CONFIG BLOCK =======
 # ==========================
 
-CSV_PATH = "projections_2025_wk0.csv"  # <-- set to your projections CSV
+CSV_PATH = "data/projections_2025_wk0.csv"  # <-- set to your projections CSV
 
-LEAGUE_SIZE = 5
-NUM_ROUNDS = 16  # total rounds to simulate
+LEAGUE_SIZE = 10
+NUM_ROUNDS = 3  # total rounds to simulate
 
 ROSTER_RULES = RosterRules(
     starters={
@@ -60,7 +60,7 @@ ROSTER_RULES = RosterRules(
         "K": 1,
     },
     flex_positions={Position.RB, Position.WR, Position.TE},
-    bench=6,
+    bench=2,
     caps={"QB": 3, "TE": 3, "K": 2, "DST": 2},  # safety caps to avoid weird hoarding
 )
 
@@ -69,7 +69,7 @@ ENGINE_PARAMS = EngineParams(
     value_model=ValueModelParams(use_vor=False)
 )
 
-ENGINE_VERBOSITY = Verbosity.PICKS  # medium verbosity (one line per pick)
+ENGINE_VERBOSITY = Verbosity.DEBUG  # medium verbosity (one line per pick)
 
 PRINT_FULL_ROSTERS = True  # set False to only print tallies
 
@@ -192,7 +192,7 @@ def main():
         if i % 5 == 2:
             engine.config.verbosity = Verbosity.DEBUG
         engine.make_pick(state)
-        engine.config.verbosity = Verbosity.PICKS
+        engine.config.verbosity = ENGINE_VERBOSITY
 
     # Summaries
     _print_roster_tallies(state)

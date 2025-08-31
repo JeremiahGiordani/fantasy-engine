@@ -65,7 +65,7 @@ from src.fantasy.marginal_value import value_now_for_candidates  # for optional 
 # ===== CONFIG BLOCK =======
 # ==========================
 
-CSV_PATH = "projections_2025_wk0.csv"  # <-- set this to your CSV file
+CSV_PATH = "data/projections_2025_wk0.csv"  # <-- set this to your CSV file
 
 LEAGUE_SIZE = 10
 MY_TEAM_INDEX = 0
