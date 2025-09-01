@@ -355,6 +355,69 @@ class DraftEngine:
 
         state.advance_one_pick()
         return best_row
+    
+
+        # -----------------------------
+    # Simple roster-need weights (no VOR, no scarcity)
+    # -----------------------------
+    
+
+    def _adjust_next_turn_exp_for_flex(
+        self,
+        state: DraftState,
+        team_idx: int,
+        cand_entries: List[Tuple[int, Position, float, Dict[Position, float]]],
+    ) -> Dict[int, Dict[Position, float]]:
+        """
+        Inputs:
+          - cand_entries: list of (uid, pos, delta_now, exp_by_pos) for each candidate,
+            where exp_by_pos is the per-position expected Δ_now at the *next* pick,
+            already computed under the hypothetical of taking this candidate now.
+
+        Behavior:
+          - If we're in a FLEX contest (FLEX remaining > 0 and ≥2 FLEX-eligible positions
+            have dedicated needs satisfied), pick the FLEX-eligible candidate with the
+            largest Δ_now (call them 'best_flex_now').
+          - For every candidate NOT in the FLEX-eligible vying set, replace their next-turn
+            values for *all FLEX-eligible vying positions* with the values from
+            best_flex_now's exp_by_pos (i.e., assume we'd take best_flex_now now, so
+            the next-turn FLEX landscape reflects FLEX being consumed).
+          - Otherwise, return the maps unchanged.
+
+        Returns:
+          - dict: uid -> adjusted exp_by_pos
+        """
+        rules = state.league.rules
+        flex_elig = set(rules.flex_positions)
+        # Current roster needs (BEFORE taking any candidate)
+        need, flex_left = _required_starter_needs(state, team_idx)
+
+        # FLEX contest if: we still have FLEX to fill AND at least two FLEX-eligible positions have no dedicated need left
+        vying_positions = {p for p in flex_elig if need.get(p, 0) == 0}
+        if flex_left <= 0 or len(vying_positions) < 2:
+            # No adjustment needed
+            return {uid: dict(exp_by_pos) for (uid, _, _, exp_by_pos) in cand_entries}
+
+        # Among candidates, find the best immediate FLEX-eligible pick by Δ_now
+        flex_cands = [(uid, pos, dn, exp) for (uid, pos, dn, exp) in cand_entries if pos in vying_positions]
+        if not flex_cands:
+            # No FLEX-eligible candidate to anchor the adjustment; leave as-is
+            return {uid: dict(exp_by_pos) for (uid, _, _, exp_by_pos) in cand_entries}
+
+        uid_best, pos_best, dn_best, exp_best = max(flex_cands, key=lambda t: t[2])
+
+        # Build adjusted maps
+        adjusted: Dict[int, Dict[Position, float]] = {}
+        for (uid, pos, dn, exp_map) in cand_entries:
+            new_map = dict(exp_map)
+            # For candidates NOT vying for FLEX, overwrite all vying FLEX positions
+            if pos not in vying_positions:
+                for p in vying_positions:
+                    new_map[p] = float(exp_best.get(p, 0.0))
+            adjusted[uid] = new_map
+
+        return adjusted
+
 
     # ---------- Internals ----------
     def _recommend_for_team(
@@ -428,6 +491,8 @@ class DraftEngine:
                 )
 
             # Scoring loop for candidates (uses actual pair-aware weighted expectation)
+            cand_buffer_corner: List[Tuple[int, Position, float, Dict[Position, float]]] = []
+
             for pl in candidates:
                 dn = float(delta_now_map.get(pl.uid, 0.0))
 
@@ -454,24 +519,47 @@ class DraftEngine:
                     p2_star = pl.position
                     d2_immediate = 0.0
 
-                # Next-turn *after the pair* using weighted expectation:
+                # Next-turn *after the pair*
                 post_exp_by_pos: Dict[Position, float] = {}
                 for p, vals in m_by_pos.items():
                     rp_post = 1.0 + (1.0 if p == p2_star else 0.0) + float(lam_post.get(p, 0.0))
                     post_exp_by_pos[p] = interpolate_at_rank(vals, rp_post) if vals else 0.0
 
-                
-                # IMPLEMENTATION WILL GO HERE
+                # Buffer for post-processing
+                cand_buffer_corner.append((pl.uid, pl.position, dn + d2_immediate, post_exp_by_pos))
 
-                # AS YOU CAN SEE, WE'RE DOING A SIMPLE SUM OVER EXPECTATION
+            # Post-process post-pair maps (collapse FLEX optionality for non-FLEX first-pick types)
+            # We pass dn+d2_immediate as "now" to select the best FLEX anchor sensibly for the pair.
+            adjusted_corner_maps = self._adjust_next_turn_exp_for_flex(state, team_idx, cand_buffer_corner)
 
-                # REPLACE THESE WITH THE ALGORITHM
+            # Score rows using adjusted post-pair maps
+            for pl in candidates:
+                dn = float(delta_now_map.get(pl.uid, 0.0))
 
-                dnext_postpair = sum(post_exp_by_pos.values())
+                # Recompute immediate second (p2_star, d2_immediate) to include in utility
+                m_by_pos, _ = top_marginals_by_position_after_pick(
+                    state=state,
+                    pool=self.pool,
+                    config=self.config,
+                    team_idx=team_idx,
+                    a_uid=pl.uid,
+                    per_pos_k=k_needed_corner,
+                )
+                sec_vals: Dict[Position, float] = {}
+                for p, vals in m_by_pos.items():
+                    rp2 = 1.0 + (1.0 if p == pl.position else 0.0)
+                    sec_vals[p] = interpolate_at_rank(vals, rp2) if vals else 0.0
+                if sec_vals:
+                    p2_star = max(sec_vals.keys(), key=lambda pos: sec_vals[pos])
+                    d2_immediate = sec_vals[p2_star]
+                else:
+                    p2_star = pl.position
+                    d2_immediate = 0.0
+
+                exp_map_adj = adjusted_corner_maps.get(pl.uid, {})
+                dnext_postpair = sum(exp_map_adj.values())
 
                 util = dn + d2_immediate + dnext_postpair
-
-                # END IMLEMENTATION
 
                 row = CandidateRow(
                     uid=pl.uid,
@@ -479,7 +567,7 @@ class DraftEngine:
                     team=pl.team,
                     position=pl.position,
                     value_now=dn,
-                    exp_next=dnext_postpair,  # after the pair
+                    exp_next=dnext_postpair,
                     utility=util,
                     adp=pl.proj.adp,
                     mu=pl.proj.mu,
@@ -513,6 +601,8 @@ class DraftEngine:
             )
 
         # Scoring loop (uses hypothetical a added because Term-2 needs post-a ranks)
+        cand_buffer: List[Tuple[int, Position, float, Dict[Position, float]]] = []
+
         for pl in candidates:
             dn = float(delta_now_map.get(pl.uid, 0.0))
 
@@ -530,18 +620,18 @@ class DraftEngine:
             for p, vals in m_by_pos.items():
                 rp = 1.0 + (1.0 if p == pl.position else 0.0) + lam.get(p, 0.0)
                 exp_by_pos[p] = interpolate_at_rank(vals, rp) if vals else 0.0
-            
-            # IMPLEMENTATION WILL GO HERE
 
-            # AS YOU CAN SEE, WE'RE DOING A SIMPLE SUM OVER EXPECTATION
+            cand_buffer.append((pl.uid, pl.position, dn, exp_by_pos))
 
-            # REPLACE THESE WITH THE ALGORITHM
+        # --- NEW: Post-process next-turn maps to collapse FLEX optionality for non-FLEX candidates
+        adjusted_maps = self._adjust_next_turn_exp_for_flex(state, team_idx, cand_buffer)
 
-            dnext = sum(exp_by_pos.values())
-
+        # Now score with the adjusted maps (simple SUM, per your original good behavior)
+        for pl in candidates:
+            dn = float(delta_now_map.get(pl.uid, 0.0))
+            exp_map_adj = adjusted_maps.get(pl.uid, {})
+            dnext = sum(exp_map_adj.values())
             util = dn + dnext
-
-            # END IMLEMENTATION
 
             row = CandidateRow(
                 uid=pl.uid,
@@ -565,13 +655,19 @@ class DraftEngine:
         return best, per_pos_debug_for_best, top5, rows
 
 
+
     def _feasible_candidates_for_team(self, state: DraftState, team_idx: int) -> List:
         """
-        Build the candidate pool for the team on the clock, with HARD FEASIBILITY:
-        - A candidate is kept only if, after taking them, the team can still fill
-          all REQUIRED starters with its remaining picks.
-        - Also applies position caps and early K/DST gate.
-        - Pre-trims by a fast baseline score to limit evaluation cost.
+        Build the candidate pool for the team on the clock with HARD FEASIBILITY and gates.
+
+        Changes from previous version:
+        - Ensure representation: take up to TOP_N_PER_POS skill players (QB/RB/WR/TE) *per position*
+          after applying all rules (caps, early K/DST gate, must-pick window, feasibility).
+        - K/DST are not part of the per-position "top-N" pass; they enter only when the gates allow, and
+          we include a small number of them (if they are required right now) or as extras later.
+        - After the per-position selection, fill with best remaining players (any position that passed
+          gating/feasibility) until we reach candidate_pool_size. We never drop the per-position picks,
+          even if that temporarily exceeds candidate_pool_size; in practice TOP_N_PER_POS keeps this small.
         """
         cfg = self.config
         rules = cfg.league.rules
@@ -581,13 +677,21 @@ class DraftEngine:
         roster = state.rosters[team_idx]
         taken = state.drafted_uids
 
+        # Tunable caps
+        TOP_N_PER_POS = getattr(getattr(cfg, "engine", object()), "per_pos_candidate_cap", 5)
+        TOP_N_KDST_IF_REQUIRED = getattr(getattr(cfg, "engine", object()), "per_pos_candidate_cap_kdst", 3)
+        CANDIDATE_POOL_SIZE = int(getattr(getattr(cfg, "engine", object()), "candidate_pool_size", cfg.engine.candidate_pool_size))
+
         # Compute must-pick window flag (if remaining picks == required still to fill)
         need, flex_left = _required_starter_needs(state, team_idx)
         L = _picks_remaining_for_team(state, team_idx)
         req_total = int(sum(need.values()) + flex_left)
         must_pick_window = (L == req_total)
 
-        pool_list = []
+        # Buckets by position after applying all the gates/feasibility checks
+        by_pos: Dict[Position, List] = {p: [] for p in (Position.QB, Position.RB, Position.WR, Position.TE, Position.DST, Position.K)}
+
+        # --- Filter pass with existing rules ---
         for uid, pl in self.pool.by_uid.items():
             if uid in taken:
                 continue
@@ -597,39 +701,97 @@ class DraftEngine:
             if cap is not None and roster.count(pl.position) >= cap:
                 continue
 
-            # Early K/DST gate
+            # Early K/DST gate (unchanged semantics)
             if gate_kdst and pl.position in (Position.K, Position.DST) and not _core_starters_filled(state, team_idx):
                 # still allow if we're in a must-pick window that requires K/DST
                 if not must_pick_window or need.get(pl.position, 0) <= 0:
                     continue
 
-            # HARD FEASIBILITY: skip if taking this player would make it impossible
+            # HARD FEASIBILITY: skip if selecting this player now would make it impossible
             # to finish required slots in remaining picks.
             if not _would_pick_be_feasible(state, team_idx, pl.position):
                 continue
 
-            # If we are in a must-pick window, only allow picks that reduce required needs
-            # (i.e., dedicated need at that position > 0, or FLEX-eligible when flex_left > 0)
+            # Must-pick window: only allow picks that reduce required needs (dedicated or FLEX-eligible)
             if must_pick_window:
                 reduces_dedicated = (pl.position in need and need[pl.position] > 0)
                 reduces_flex = (pl.position in rules.flex_positions and flex_left > 0)
                 if not (reduces_dedicated or reduces_flex):
                     continue
 
-            pool_list.append(pl)
+            by_pos[pl.position].append(pl)
 
-        if not pool_list:
+        # If literally nothing passed, return empty
+        if all(len(lst) == 0 for lst in by_pos.values()):
             return []
 
-        # Pre-trim by a fast baseline score (μ with tiny ADP nudge)
+        # Fast baseline score (μ with tiny ADP nudge)
         def baseline(pl):
             mu = float(pl.proj.mu or 0.0)
             adp = pl.proj.adp
             adp_bonus = (0.001 / max(1.0, adp)) if adp is not None else 0.0
             return mu + adp_bonus
 
-        pool_list.sort(key=baseline, reverse=True)
-        return pool_list[: int(cfg.engine.candidate_pool_size)]
+        for p in by_pos:
+            by_pos[p].sort(key=baseline, reverse=True)
+
+        # --- Per-position selection: ensure top-N for skill positions only ---
+        skill_positions = (Position.QB, Position.RB, Position.WR, Position.TE)
+
+        selected: List = []
+        for p in skill_positions:
+            if by_pos[p]:
+                selected.extend(by_pos[p][:TOP_N_PER_POS])
+
+        # K/DST handling:
+        # - Do NOT include top-N K/DST by default.
+        # - If we are in a must-pick window AND K or DST are required, include a few of them.
+        if must_pick_window:
+            if need.get(Position.K, 0) > 0 and by_pos[Position.K]:
+                selected.extend(by_pos[Position.K][:TOP_N_KDST_IF_REQUIRED])
+            if need.get(Position.DST, 0) > 0 and by_pos[Position.DST]:
+                selected.extend(by_pos[Position.DST][:TOP_N_KDST_IF_REQUIRED])
+
+        # De-duplicate while preserving order
+        seen = set()
+        selected_dedup: List = []
+        for pl in selected:
+            if pl.uid not in seen:
+                selected_dedup.append(pl)
+                seen.add(pl.uid)
+        selected = selected_dedup
+
+        # --- Fill with best remaining (any position that passed checks), prioritizing non-K/DST ---
+        # We do NOT drop per-position picks even if they exceed pool size; we only add extras up to cap.
+        if len(selected) < CANDIDATE_POOL_SIZE:
+            # Build a single "remaining" list sorted by baseline: prefer non-K/DST first
+            remaining_non_kdst = []
+            remaining_kdst = []
+            for p in (Position.RB, Position.WR, Position.TE, Position.QB, Position.DST, Position.K):
+                for pl in by_pos[p]:
+                    if pl.uid in seen:
+                        continue
+                    # Respect the early K/DST gate: if they got here, gate allowed them already
+                    if p in (Position.DST, Position.K):
+                        remaining_kdst.append(pl)
+                    else:
+                        remaining_non_kdst.append(pl)
+
+            remaining_all = sorted(remaining_non_kdst, key=baseline, reverse=True)
+            # Only append K/DST if we still have room AND they passed the earlier gate
+            remaining_all.extend(sorted(remaining_kdst, key=baseline, reverse=True))
+
+            for pl in remaining_all:
+                if len(selected) >= CANDIDATE_POOL_SIZE:
+                    break
+                if pl.uid in seen:
+                    continue
+                selected.append(pl)
+                seen.add(pl.uid)
+
+        # If still empty (very unlikely), just return what we have
+        return selected
+
 
 
     def _expected_removals_between_our_picks(self, state: DraftState, team_idx: int) -> Dict[Position, float]:
