@@ -9,20 +9,17 @@ Responsibilities
 - Build the feasible candidate set for the team on the clock (respecting caps/gates).
 - For each candidate a:
     Δ_now(a) = J(R ∪ {a}) - J(R)
-    Δ_next^(k)(a) ≈ max_p  m̃_p^(a)(r_p^(a)),  with  r_p^(a) = 1 + 1{p=π(a)} + λ_p
-  where λ_p are expected removals by position between now and the team's next pick.
-- Choose the candidate with maximal Utility = Δ_now + Δ_next.
-- Apply the pick to the DraftState and print diagnostics per verbosity level.
-
-This engine assumes:
-- PlayerPool contains all players (by_uid) and can filter availability via state.drafted_uids.
-- models.py, marginal_value.py, opponent_behavior.py are present as designed.
+    Non-corner: Δ_next^(k)(a) ≈ max_p  m̃_p^(a)(r_p^(a)),  with  r_p^(a) = 1 + 1{p=π(a)} + λ_p
+    Corner   : Utility(a1) = Δ_now(a1)
+                            + max_p m̃_p^(a1)(1 + 1{p=π(a1)})                    [best immediate 2nd]
+                            + max_p m̃_p^(a1)(1 + 1{p=π(a2*)} + λ_p_postpair)     [next-turn after pair]
+- Choose the candidate with maximal Utility and apply the pick.
 
 Verbosity
 ---------
 - 0 (QUIET): no printing
 - 1 (PICKS): one line per pick with key numbers
-- 2 (DEBUG): plus top-5 candidate table and next-turn per-position breakdown (values and ranks)
+- 2 (DEBUG): plus top-5 candidate table and per-position breakdown (values and ranks)
 """
 
 from dataclasses import dataclass
@@ -68,6 +65,16 @@ def next_pick_index_for_team(current_pick: int, league_size: int, team_idx: int)
         if team_on_the_clock_at(p, league_size) == team_idx:
             return p
         p += 1
+
+
+def _is_back_to_back(state: DraftState, team_idx: int) -> bool:
+    """
+    True if this team picks again immediately next (corner of the snake).
+    """
+    n = state.league.league_size
+    cur = state.pick_number
+    nxt = next_pick_index_for_team(cur, n, team_idx)
+    return (nxt == cur + 1)
 
 
 def _core_starters_filled(state: DraftState, team_idx: int) -> bool:
@@ -155,6 +162,130 @@ def _would_pick_be_feasible(
     return req_after <= max(0, L - 1)
 
 
+def _k_needed_from_lambda(lam: Dict[Position, float], primary_bonus: int = 1, margin: int = 2, cap: int = 24) -> int:
+    """
+    We will evaluate ranks of the form r_p = 1 + (primary?primary_bonus:0) + lam[p].
+    Ensure per_pos_k >= ceil(max_p r_p) + margin, but cap to keep runtime sane.
+    """
+    import math
+    max_r = 0.0
+    for p, lp in lam.items():
+        r = 1.0 + float(lp) + (primary_bonus if p is not None else 0)
+        if r > max_r:
+            max_r = r
+    k = int(math.ceil(max_r) + margin)
+    return max(5, min(k, cap))
+
+
+# --- AGGREGATED EXPECTED REMOVALS (ADP × aggregated roster demand) ---
+
+def _aggregate_expected_removals(
+    state: DraftState,
+    pool: PlayerPool,
+    start_pick: int,   # exclusive
+    end_pick: int,     # exclusive
+    my_team_idx: int,
+) -> Dict[Position, float]:
+    """
+    Compute λ_p over (start_pick, end_pick) as an aggregate:
+      - Demand side: sum required-starter needs of *opponents in span* (dedicated + FLEX share)
+      - Supply side: ADP mass among the top (M*2) available players by ADP, per position
+      - λ_p = M * [ (Demand_p^α * ADPmass_p^β) / Σ_q (Demand_q^α * ADPmass_q^β) ]
+    where M is number of opponent picks in the interval.
+    """
+    n_teams = state.league.league_size
+    M = 0
+    teams_in_span: List[int] = []
+    for q in range(start_pick + 1, end_pick):
+        t = team_on_the_clock_at(q, n_teams)
+        if t == my_team_idx:
+            continue
+        teams_in_span.append(t)
+        M += 1
+    if M <= 0:
+        return {p: 0.0 for p in Position}
+
+    # -------- Demand: aggregate required starters for teams in span --------
+    # dedicated needs + equal FLEX share across eligible positions
+    demand: Dict[Position, float] = {p: 0.0 for p in Position}
+    flex_positions = set(state.league.rules.flex_positions)
+
+    for t in teams_in_span:
+        need, flex_left = _required_starter_needs(state, t)
+        for p in (Position.QB, Position.RB, Position.WR, Position.TE, Position.DST, Position.K):
+            demand[p] += float(max(0, need.get(p, 0)))
+        if flex_left > 0 and flex_positions:
+            share = float(flex_left) / float(len(flex_positions))
+            for p in flex_positions:
+                demand[p] += share
+
+    # Light gating: if many teams still lack core starters, downweight K/DST demand a bit
+    core_unfilled = 0
+    for t in teams_in_span:
+        if not _core_starters_filled(state, t):
+            core_unfilled += 1
+    if core_unfilled > 0:
+        demand[Position.K] *= 0.35
+        demand[Position.DST] *= 0.35
+
+    # Discourage early backup QB/TE demand somewhat (aggregate version)
+    # If average QB/TE owned >= 1 across span, shrink backup demand a bit
+    # (crude but stabilizing)
+    avg_qb_owned = sum(state.rosters[t].count(Position.QB) for t in teams_in_span) / max(1, len(teams_in_span))
+    avg_te_owned = sum(state.rosters[t].count(Position.TE) for t in teams_in_span) / max(1, len(teams_in_span))
+    if avg_qb_owned >= 1.0:
+        demand[Position.QB] *= 0.7
+    if avg_te_owned >= 1.0:
+        demand[Position.TE] *= 0.8
+
+    # -------- Supply: ADP mass among top available players --------
+    taken = state.drafted_uids
+    avail = [pl for pl in pool.by_uid.values() if pl.uid not in taken]
+    # Sort by ADP (missing ADP treated as very late)
+    def _adp_key(pl):
+        return float(pl.proj.adp) if pl.proj.adp is not None else 1e9
+    avail.sort(key=_adp_key)
+
+    topN = max(15, M * 2)  # look a bit beyond span size
+    top_avail = avail[:topN]
+
+    adp_mass: Dict[Position, float] = {p: 0.0 for p in Position}
+    # Weighting: closer ADP -> larger mass. Use 1/(1+ADP) as a simple monotone weight.
+    for pl in top_avail:
+        adp = pl.proj.adp if pl.proj.adp is not None else 1e9
+        w = 1.0 / (1.0 + float(adp))
+        adp_mass[pl.position] += w
+
+    # If a position has zero ADP mass (e.g., no top players left), give a tiny epsilon
+    for p in adp_mass:
+        if adp_mass[p] <= 0.0:
+            adp_mass[p] = 1e-6
+
+    # -------- Combine demand & supply --------
+    alpha = 1.0  # demand exponent
+    beta = 1.0   # ADP mass exponent
+    raw: Dict[Position, float] = {}
+    for p in Position:
+        raw[p] = (demand.get(p, 0.0) ** alpha) * (adp_mass.get(p, 0.0) ** beta)
+
+    tot = sum(raw.values())
+    if tot <= 0.0:
+        # Fallback: split evenly across skill positions
+        base = M / 4.0
+        return {
+            Position.QB: base,
+            Position.RB: base,
+            Position.WR: base,
+            Position.TE: base,
+            Position.DST: 0.0,
+            Position.K: 0.0,
+        }
+
+    lam = {p: (M * raw[p] / tot) for p in Position}
+    return lam
+
+
+
 # -----------------------------
 # DraftEngine
 # -----------------------------
@@ -173,7 +304,7 @@ class DraftEngine:
         """
         team_idx = state.team_on_the_clock()
 
-        best_row, breakdown, top5 = self._recommend_for_team(state, team_idx)
+        best_row, breakdown, top5, rows = self._recommend_for_team(state, team_idx)
         if best_row is None:
             if self.config.verbosity >= Verbosity.PICKS:
                 print(f"{state.pick_number:3d}. Team {team_idx} -> (no feasible candidates)")
@@ -203,6 +334,18 @@ class DraftEngine:
                     f"Δ_now={r.value_now:7.2f}  Δ_next={r.exp_next:7.2f}  "
                     f"U={r.utility:7.2f}  ADP={r.adp if r.adp is not None else 'NA'}"
                 )
+
+            shown_positions = {r.position for r in top5}
+            for pos in (Position.QB, Position.RB, Position.WR, Position.TE):
+                if pos not in shown_positions:
+                    best_pos = max((r for r in rows if r.position == pos),
+                                key=lambda r: r.utility, default=None)
+                    if best_pos:
+                        print(
+                            f"      - {best_pos.name:20s} {best_pos.position.value:>3s}  "
+                            f"Δ_now={best_pos.value_now:7.2f}  Δ_next={best_pos.exp_next:7.2f}  "
+                            f"U={best_pos.utility:7.2f}  ADP={best_pos.adp if best_pos.adp is not None else 'NA'}"
+                        )
             if breakdown is not None:
                 print("    Next-turn breakdown by position:")
                 for p in sorted(breakdown.exp_by_pos.keys(), key=lambda x: x.value):
@@ -214,54 +357,191 @@ class DraftEngine:
         return best_row
 
     # ---------- Internals ----------
-
     def _recommend_for_team(
         self,
         state: DraftState,
         team_idx: int,
-    ) -> Tuple[Optional[CandidateRow], Optional[NextTurnBreakdown], List[CandidateRow]]:
+    ) -> Tuple[Optional[CandidateRow], Optional[NextTurnBreakdown], List[CandidateRow], List[CandidateRow]]:
         """
-        Core evaluation: compute Utility = Δ_now(a) + Δ_next^(k)(a) for feasible candidates,
-        return the best, plus optional breakdown and a top-5 list for verbose printing.
+        Core evaluation:
+        - Non-corner: Utility = Δ_now(a) + (need-weighted expectation over positions)
+        - Corner    : Utility = Δ_now(a1) + best_immediate_second(a1) + weighted next-turn after the pair
+        where the next-turn component is computed with aggregate λ over the interval after our second pick.
+        DEBUG breakdown now shows **RAW** next-turn expectations: evaluated at r_raw = 1 + λ_p
+        using marginal lists built from the current state (no hypothetical pick applied).
+        Returns: (best_row, debug_breakdown, top5, rows)
         """
         candidates = self._feasible_candidates_for_team(state, team_idx)
         if not candidates:
-            return None, None, []
+            return None, None, [], []
 
-        # Expected removals λ_p between now and our next pick
-        lam = self._expected_removals_between_our_picks(state, team_idx)
+        # Precompute Δ_now for speed (vectorized-ish)
+        delta_now_map = value_now_for_candidates(
+            state, self.pool, self.config, team_idx, [p.uid for p in candidates]
+        )
 
-        # Evaluate candidates
         rows: List[CandidateRow] = []
         per_pos_debug_for_best: Optional[NextTurnBreakdown] = None
         best: Optional[CandidateRow] = None
 
-        # Precompute Δ_now for speed (vectorized-ish)
-        delta_now_map = value_now_for_candidates(state, self.pool, self.config, team_idx, [p.uid for p in candidates])
+        # Small local helper: build RAW marginal lists (no pick applied) for top-k per position
+        def _raw_marginals_for_current_state(per_pos_k: int) -> Dict[Position, List[float]]:
+            taken = state.drafted_uids
+            avail_uids = [uid for uid in self.pool.by_uid.keys() if uid not in taken]
+            # Compute Δ_now for each available player if we added them now (current roster R)
+            dn_map = value_now_for_candidates(state, self.pool, self.config, team_idx, avail_uids)
+            by_pos: Dict[Position, List[float]] = {p: [] for p in Position}
+            for uid in avail_uids:
+                pl = self.pool.by_uid[uid]
+                by_pos[pl.position].append(float(dn_map.get(uid, 0.0)))
+            # Sort desc and truncate to k
+            for p in by_pos:
+                by_pos[p].sort(reverse=True)
+                if per_pos_k is not None and per_pos_k > 0:
+                    by_pos[p] = by_pos[p][:per_pos_k]
+            return by_pos
 
+        # ----- Corner (back-to-back) branch: pair-aware scoring with weighted next-turn -----
+        if _is_back_to_back(state, team_idx):
+            n = state.league.league_size
+            cur_pick = state.pick_number
+            next_after_pair = next_pick_index_for_team(cur_pick + 1, n, team_idx)
+
+            # Expected removals AFTER the pair (used for both sizing and post-pair ranks)
+            lam_post = self._expected_removals_between_picks(
+                state, team_idx, start_pick=cur_pick + 1, end_pick=next_after_pair
+            )
+            # Depth needed so r_post(p) = 1 + 1{p = p2*} + λ_p sits inside lists
+            k_needed_corner = _k_needed_from_lambda(lam_post, primary_bonus=1, margin=2, cap=24)
+
+            # --- DEBUG RAW breakdown (corner): build raw lists from current state, no picks applied
+            if self.config.verbosity >= Verbosity.DEBUG:
+                m_raw = _raw_marginals_for_current_state(per_pos_k=k_needed_corner)
+                raw_rank_by_pos: Dict[Position, float] = {}
+                raw_exp_by_pos: Dict[Position, float] = {}
+                for p, vals in m_raw.items():
+                    r_raw = 1.0 + float(lam_post.get(p, 0.0))  # post-pair window, but no +1 for our picks
+                    raw_rank_by_pos[p] = r_raw
+                    raw_exp_by_pos[p] = interpolate_at_rank(vals, r_raw) if vals else 0.0
+                per_pos_debug_for_best = NextTurnBreakdown(
+                    exp_by_pos=raw_exp_by_pos, rank_by_pos=raw_rank_by_pos
+                )
+
+            # Scoring loop for candidates (uses actual pair-aware weighted expectation)
+            for pl in candidates:
+                dn = float(delta_now_map.get(pl.uid, 0.0))
+
+                # Per-position marginal lists AFTER taking a1 = pl (for immediate second + post-pair calc)
+                m_by_pos, _ = top_marginals_by_position_after_pick(
+                    state=state,
+                    pool=self.pool,
+                    config=self.config,
+                    team_idx=team_idx,
+                    a_uid=pl.uid,
+                    per_pos_k=k_needed_corner,
+                )
+
+                # Best immediate second pick (no opponents between our two picks)
+                sec_vals: Dict[Position, float] = {}
+                for p, vals in m_by_pos.items():
+                    rp2 = 1.0 + (1.0 if p == pl.position else 0.0)
+                    sec_vals[p] = interpolate_at_rank(vals, rp2) if vals else 0.0
+
+                if sec_vals:
+                    p2_star = max(sec_vals.keys(), key=lambda pos: sec_vals[pos])
+                    d2_immediate = sec_vals[p2_star]
+                else:
+                    p2_star = pl.position
+                    d2_immediate = 0.0
+
+                # Next-turn *after the pair* using weighted expectation:
+                post_exp_by_pos: Dict[Position, float] = {}
+                for p, vals in m_by_pos.items():
+                    rp_post = 1.0 + (1.0 if p == p2_star else 0.0) + float(lam_post.get(p, 0.0))
+                    post_exp_by_pos[p] = interpolate_at_rank(vals, rp_post) if vals else 0.0
+
+                
+                # IMPLEMENTATION WILL GO HERE
+
+                # AS YOU CAN SEE, WE'RE DOING A SIMPLE SUM OVER EXPECTATION
+
+                # REPLACE THESE WITH THE ALGORITHM
+
+                dnext_postpair = sum(post_exp_by_pos.values())
+
+                util = dn + d2_immediate + dnext_postpair
+
+                # END IMLEMENTATION
+
+                row = CandidateRow(
+                    uid=pl.uid,
+                    name=pl.name,
+                    team=pl.team,
+                    position=pl.position,
+                    value_now=dn,
+                    exp_next=dnext_postpair,  # after the pair
+                    utility=util,
+                    adp=pl.proj.adp,
+                    mu=pl.proj.mu,
+                    vor=pl.proj.vor,
+                )
+                rows.append(row)
+
+                if (best is None) or (row.utility > best.utility):
+                    best = row
+
+            rows.sort(key=lambda r: r.utility, reverse=True)
+            top5 = rows[:5]
+            return best, per_pos_debug_for_best, top5, rows
+
+        # ----- Non-corner: one-step lookahead with weighted expectation -----
+        lam = self._expected_removals_between_our_picks(state, team_idx)
+
+        # --- DEBUG RAW breakdown (non-corner): build raw lists from current state, no pick applied
+        k_needed = _k_needed_from_lambda(lam, primary_bonus=0, margin=2, cap=24)  # primary_bonus=0 for raw
+        m_raw = None
+        if self.config.verbosity >= Verbosity.DEBUG:
+            m_raw = _raw_marginals_for_current_state(per_pos_k=k_needed)
+            raw_rank_by_pos: Dict[Position, float] = {}
+            raw_exp_by_pos: Dict[Position, float] = {}
+            for p, vals in m_raw.items():
+                r_raw = 1.0 + float(lam.get(p, 0.0))
+                raw_rank_by_pos[p] = r_raw
+                raw_exp_by_pos[p] = interpolate_at_rank(vals, r_raw) if vals else 0.0
+            per_pos_debug_for_best = NextTurnBreakdown(
+                exp_by_pos=raw_exp_by_pos, rank_by_pos=raw_rank_by_pos
+            )
+
+        # Scoring loop (uses hypothetical a added because Term-2 needs post-a ranks)
         for pl in candidates:
-            dn = delta_now_map.get(pl.uid, 0.0)
+            dn = float(delta_now_map.get(pl.uid, 0.0))
 
-            # Build m_p^{(a)} lists after taking a = pl
+            k_needed_eval = _k_needed_from_lambda(lam, primary_bonus=1, margin=2, cap=24)
             m_by_pos, _ = top_marginals_by_position_after_pick(
                 state=state,
                 pool=self.pool,
                 config=self.config,
                 team_idx=team_idx,
                 a_uid=pl.uid,
-                per_pos_k=5,  # enough for interpolation around r in typical cases
+                per_pos_k=k_needed_eval,
             )
 
-            # Compute r_p^(a) and interpolated expected next values by position
-            rank_by_pos: Dict[Position, float] = {}
             exp_by_pos: Dict[Position, float] = {}
             for p, vals in m_by_pos.items():
                 rp = 1.0 + (1.0 if p == pl.position else 0.0) + lam.get(p, 0.0)
-                rank_by_pos[p] = rp
                 exp_by_pos[p] = interpolate_at_rank(vals, rp) if vals else 0.0
+            
+            # IMPLEMENTATION WILL GO HERE
 
-            dnext = max(exp_by_pos.values()) if exp_by_pos else 0.0
+            # AS YOU CAN SEE, WE'RE DOING A SIMPLE SUM OVER EXPECTATION
+
+            # REPLACE THESE WITH THE ALGORITHM
+
+            dnext = sum(exp_by_pos.values())
+
             util = dn + dnext
+
+            # END IMLEMENTATION
 
             row = CandidateRow(
                 uid=pl.uid,
@@ -279,21 +559,17 @@ class DraftEngine:
 
             if (best is None) or (row.utility > best.utility):
                 best = row
-                if self.config.verbosity >= Verbosity.DEBUG:
-                    per_pos_debug_for_best = NextTurnBreakdown(exp_by_pos=exp_by_pos, rank_by_pos=rank_by_pos)
 
-        # Sort for top-5 printing
         rows.sort(key=lambda r: r.utility, reverse=True)
         top5 = rows[:5]
-
-        return best, per_pos_debug_for_best, top5
+        return best, per_pos_debug_for_best, top5, rows
 
 
     def _feasible_candidates_for_team(self, state: DraftState, team_idx: int) -> List:
         """
         Build the candidate pool for the team on the clock, with HARD FEASIBILITY:
         - A candidate is kept only if, after taking them, the team can still fill
-        all REQUIRED starters with its remaining picks.
+          all REQUIRED starters with its remaining picks.
         - Also applies position caps and early K/DST gate.
         - Pre-trims by a fast baseline score to limit evaluation cost.
         """
@@ -355,32 +631,37 @@ class DraftEngine:
         pool_list.sort(key=baseline, reverse=True)
         return pool_list[: int(cfg.engine.candidate_pool_size)]
 
+
     def _expected_removals_between_our_picks(self, state: DraftState, team_idx: int) -> Dict[Position, float]:
         """
-        Compute λ_p = expected number of players at position p removed between our
-        current pick and our next pick (exclusive of our own picks).
-        Sum P_t^{(q)}(p) across each opponent pick q in that span.
+        Aggregate model: compute λ_p over the entire span to our next pick using ADP mass
+        and aggregated roster demand across the opponents in that span.
         """
-        lam: Dict[Position, float] = {p: 0.0 for p in Position}
         n = state.league.league_size
         current_pick = state.pick_number
         next_pick = next_pick_index_for_team(current_pick, n, team_idx)
+        return _aggregate_expected_removals(
+            state=state,
+            pool=self.pool,
+            start_pick=current_pick,
+            end_pick=next_pick,
+            my_team_idx=team_idx,
+        )
 
-        # For each pick between (current_pick, next_pick), add that team's position probabilities
-        for q in range(current_pick + 1, next_pick):
-            opp_team = team_on_the_clock_at(q, n)
-            # Skip our own team defensively
-            if opp_team == team_idx:
-                continue
-
-            probs = position_probabilities_for_team(
-                state=state,
-                pool=self.pool,
-                config=self.config,
-                team_idx=opp_team,
-                pick_index=q,
-            )
-            for p, pr in probs.items():
-                lam[p] += float(pr)
-
-        return lam
+    def _expected_removals_between_picks(
+        self,
+        state: DraftState,
+        team_idx: int,
+        start_pick: int,
+        end_pick: int,
+    ) -> Dict[Position, float]:
+        """
+        Aggregate model over an arbitrary interval (start, end), exclusive of endpoints.
+        """
+        return _aggregate_expected_removals(
+            state=state,
+            pool=self.pool,
+            start_pick=start_pick,
+            end_pick=end_pick,
+            my_team_idx=team_idx,
+        )
