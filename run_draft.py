@@ -1,50 +1,39 @@
-# run_draft.py
+# live_draft.py
 """
-Run-time helper for a LIVE or PRACTICE draft.
+Interactive live draft assistant using DraftEngine.
+
+What this does
+--------------
 - Loads a projections CSV into a PlayerPool
-- Builds a league + engine config
-- Applies any manual picks (what other teams already drafted)
-- Prints a recommendation for YOUR next pick at high verbosity
-- (Optionally) lets you execute the pick to mutate state
+- Builds a league + engine config (same knobs you used for mock)
+- Runs an interactive snake draft where you:
+    * Type the real-life player picked for each team
+    * When it's YOUR pick, it shows full recommendations (TRACE)
+      and lets you choose your player (or auto-pick best)
+- Prints a running "board" of picks and supports simple commands
 
-HOW TO USE:
-1) Edit the CONFIG BLOCK below:
-   - CSV_PATH: path to your projections CSV (e.g., "projections_2025_wk0.csv")
-   - LEAGUE_SIZE: number of teams
-   - MY_TEAM_INDEX: your team index (0-based)
-   - ROSTER_RULES: starting lineup + bench + flex config for your league
-   - MANUAL_PICKS: list of what has ALREADY happened in the real draft, in order.
-        Each item is dict(name=..., team=..., pos=...) OR dict(uid=...)
-        Only one of (uid) or (name[, team, pos]) is needed.
-        Examples:
-            {"name": "Bijan Robinson", "team": "ATL", "pos": "RB"}
-            {"uid": "Bijan Robinson|ATL|RB"}  # if you know the uid format
+How to use
+---------
+1) Set CSV_PATH or pass --csv on the CLI (defaults provided).
+2) Run:  python live_draft.py --my-team 0  (or whichever team index is yours)
+3) Follow the prompts. Type a player's name to register the pick.
+   Commands: help, board, roster [team], mine, auto, undo, skip, quit
 
-2) Run:
-   python run_draft.py
-
-3) It will print:
-   - current state (pick number, who's on the clock)
-   - a recommendation for your next pick (top-5, plus next-turn per-position breakdown)
-   - You can set VERBOSITY to 0/1/2; this script forces 2 for clarity.
-
-CSV REQUIREMENTS:
-- Flexible; we try to map common column names:
-    player/name, position/pos, team, points/mu, vor, adp, floor, ceiling, sigma/sd
-- Unknown columns are ignored. Missing values default to None.
-
-TIP:
-If you’re mid-draft, just append picks in MANUAL_PICKS to reflect what already happened,
-then re-run this script. It will recompute from the CSV and print a fresh recommendation.
+Notes
+-----
+- Player lookup is by name (case-insensitive); if ambiguous, you’ll be asked to disambiguate.
+- For your pick, we show full TRACE recommendations *before* you draft.
+- For others' picks, we simply record who they took. You can also type 'auto' to let the bot pick.
 """
 
 from __future__ import annotations
 
+import argparse
 import csv
-from dataclasses import dataclass
-from typing import Dict, List, Optional
+import sys
+from typing import Dict, List, Optional, Tuple
 
-from src.fantasy.models import (
+from fantasy.models import (
     DraftEngineConfig,
     DraftState,
     EngineParams,
@@ -56,22 +45,20 @@ from src.fantasy.models import (
     RosterRules,
     StartShareCurves,
     Verbosity,
+    ValueModelParams,
 )
 from src.fantasy.draft_engine import DraftEngine
-from src.fantasy.marginal_value import value_now_for_candidates  # for optional extra checks
 
 
 # ==========================
-# ===== CONFIG BLOCK =======
+# ===== CONFIG DEFAULTS ====
 # ==========================
 
-CSV_PATH = "data/projections_2025_wk0.csv"  # <-- set this to your CSV file
+DEFAULT_CSV = "data/projections_2025_wk0.csv"
+DEFAULT_LEAGUE_SIZE = 5
+DEFAULT_NUM_ROUNDS = 16
 
-LEAGUE_SIZE = 10
-MY_TEAM_INDEX = 0
-
-# Starters/bench — adjust to your league
-ROSTER_RULES = RosterRules(
+DEFAULT_ROSTER_RULES = RosterRules(
     starters={
         "QB": 1,
         "RB": 2,
@@ -82,31 +69,17 @@ ROSTER_RULES = RosterRules(
         "K": 1,
     },
     flex_positions={Position.RB, Position.WR, Position.TE},
-    bench=6,
-    caps={"QB": 3, "TE": 3, "K": 2, "DST": 2},  # soft safety caps
+    bench=7,
+    caps={"QB": 3, "TE": 3, "K": 2, "DST": 2},
 )
 
-# Engine params — adjust if you’d like
-ENGINE_PARAMS = EngineParams(
+DEFAULT_ENGINE_PARAMS = EngineParams(
     start_share_priors=StartShareCurves(),
-    # use_vor=True # uses VOR if present; otherwise falls back to μ
-    # risk_lambda shrinks value for larger sigma (risk aversion)
-    # opponent model controls how we expect others to draft
+    value_model=ValueModelParams(use_vor=False),
 )
 
-# Script verbosity — we’ll force engine verbosity=DEBUG so you get rich prints
-VERBOSITY = Verbosity.DEBUG
-
-# MANUAL PICKS: what has ALREADY been drafted (absolute order from pick #1).
-# You only need to fill the fields that identify the player.
-# Examples:
-#   {"name": "Bijan Robinson", "team": "ATL", "pos": "RB"}
-#   {"uid": "Josh Allen|BUF|QB"}
-MANUAL_PICKS: List[Dict[str, str]] = [
-    # {"name": "Bijan Robinson", "team": "ATL", "pos": "RB"},
-    # {"name": "Saquon Barkley", "team": "PHI", "pos": "RB"},
-    # {"name": "Ja'Marr Chase", "team": "CIN", "pos": "WR"},
-]
+# Verbosity: we’ll always print at TRACE when showing recommendations
+RUN_VERBOSITY = Verbosity.PICKS  # general chatter
 
 
 # ==========================
@@ -143,16 +116,11 @@ def load_player_pool_from_csv(path: str) -> PlayerPool:
             if not name or not pos:
                 continue
 
-            # Map/clean position
             pos_clean = str(pos).strip().upper()
             if pos_clean not in {"QB", "RB", "WR", "TE", "K", "DST"}:
-                # Skip IDP or unsupported positions silently
                 continue
 
-            try:
-                position = Position(pos_clean)
-            except Exception:
-                continue
+            position = Position(pos_clean)
 
             mu = _to_float(_coalesce(row, ["points", "mu", "proj", "fpts", "FPTS"]))
             floor = _to_float(_coalesce(row, ["floor", "Floor"]))
@@ -181,131 +149,283 @@ def load_player_pool_from_csv(path: str) -> PlayerPool:
     return PlayerPool(by_uid=by_uid)
 
 
-def find_uid(
-    pool: PlayerPool,
-    name: Optional[str] = None,
-    team: Optional[str] = None,
-    pos: Optional[str] = None,
-    uid: Optional[str] = None,
-) -> Optional[str]:
-    """Resolve a player selection into a uid."""
-    if uid:
-        return uid if uid in pool.by_uid else None
-    if not name:
+# ==========================
+# ===== HELPER UTILS  ======
+# ==========================
+
+def _team_on_clock_str(state: DraftState, my_team: int) -> str:
+    t = state.team_on_the_clock()
+    me = " (YOU)" if t == my_team else ""
+    return f"Pick {state.pick_number:3d} — Team {t}{me}"
+
+
+def _find_matches(pool: PlayerPool, query: str) -> List[Player]:
+    q = query.strip().lower()
+    # First try exact name match
+    exact = [p for p in pool.by_uid.values() if p.name.lower() == q]
+    if exact:
+        return exact
+    # Else substring
+    return [p for p in pool.by_uid.values() if q in p.name.lower()]
+
+
+def _disambiguate(matches: List[Player]) -> Optional[Player]:
+    if not matches:
         return None
-    name_norm = name.strip().lower()
-    team_norm = team.strip().upper() if team else None
-    pos_norm = pos.strip().upper() if pos else None
-    candidates = []
-    for u, p in pool.by_uid.items():
-        if p.name.strip().lower() != name_norm:
-            continue
-        if team_norm and (p.team or "").upper() != team_norm:
-            continue
-        if pos_norm and p.position.value != pos_norm:
-            continue
-        candidates.append(u)
-    if len(candidates) == 1:
-        return candidates[0]
-    # If ambiguous, try best guess by ADP (earlier is “more prominent”)
-    if candidates:
-        candidates.sort(key=lambda u: (pool.by_uid[u].proj.adp or 9999.0))
-        return candidates[0]
-    return None
+    if len(matches) == 1:
+        return matches[0]
+    print("Ambiguous — choose one:")
+    for i, p in enumerate(matches, 1):
+        tag = f"{p.name} ({p.position.value}, {p.team or 'FA'})"
+        print(f"  {i:2d}) {tag}")
+    while True:
+        s = input("Enter number (or blank to cancel): ").strip()
+        if s == "":
+            return None
+        if s.isdigit():
+            k = int(s)
+            if 1 <= k <= len(matches):
+                return matches[k - 1]
+        print("Invalid selection.")
+
+
+def _apply_pick(state: DraftState, pool: PlayerPool, team_idx: int, player: Player) -> None:
+    state.drafted_uids.add(player.uid)
+    state.rosters[team_idx].add(player.position, player.uid)
+    state.advance_one_pick()
+
+
+def _undo_last_pick(state: DraftState) -> bool:
+    # Assumes DraftState remembers pick order? If not, we keep our own stack in main.
+    return False  # we’ll manage undo using our own stack in the script
+
+
+def _print_recommendations(engine: DraftEngine, state: DraftState) -> None:
+    """
+    Print full TRACE-style recommendations for the team currently on the clock,
+    without mutating state.
+    """
+    team_idx = state.team_on_the_clock()
+    # Temporarily raise verbosity to TRACE for printing
+    prev_v = engine.config.verbosity
+    engine.config.verbosity = getattr(Verbosity, "TRACE", 3)
+
+    best_row, breakdown, top5, rows, pos_cond_debug = engine._recommend_for_team(state, team_idx)
+
+    # Mirror the printing logic from DraftEngine.make_pick (but do NOT pick)
+    print(f"\n{_team_on_clock_str(state, team_idx)} — RECOMMENDATIONS (TRACE):")
+    if not rows:
+        print("  (no feasible candidates)")
+        engine.config.verbosity = prev_v
+        return
+
+    # Top candidates table
+    print("    Top candidates:")
+    for r in rows[:5]:
+        print(
+            f"      - {r.name:20s} {r.position.value:>3s}  "
+            f"Δ_now={r.value_now:7.2f}  Δ_next={r.exp_next:7.2f}  "
+            f"U={r.utility:7.2f}  ADP={r.adp if r.adp is not None else 'NA'}"
+        )
+    shown_positions = {r.position for r in rows[:5]}
+    for pos in (Position.QB, Position.RB, Position.WR, Position.TE):
+        if pos not in shown_positions:
+            best_pos = max((r for r in rows if r.position == pos),
+                           key=lambda r: r.utility, default=None)
+            if best_pos:
+                print(
+                    f"      - {best_pos.name:20s} {best_pos.position.value:>3s}  "
+                    f"Δ_now={best_pos.value_now:7.2f}  Δ_next={best_pos.exp_next:7.2f}  "
+                    f"U={best_pos.utility:7.2f}  ADP={best_pos.adp if best_pos.adp is not None else 'NA'}"
+                )
+
+    if breakdown is not None:
+        print("    Next-turn breakdown by position:")
+        for p in sorted(breakdown.exp_by_pos.keys(), key=lambda x: x.value):
+            val = breakdown.exp_by_pos[p]
+            rnk = breakdown.rank_by_pos[p]
+            print(f"      * {p.value:>3s}: exp={val:7.2f}, r_p(a)={rnk:.2f}")
+
+    if pos_cond_debug:
+        print("    Next-turn breakdowns conditioned on picking the top player at each position:")
+        for pos in (Position.QB, Position.RB, Position.WR, Position.TE):
+            entry = pos_cond_debug.get(pos)
+            if not entry:
+                continue
+            nm = entry['name']
+            print(f"    If pick {nm:20s} {pos.value:>3s}:")
+            exp_map = entry.get('exp_by_pos', {}) or {}
+            rnk_map = entry.get('rank_by_pos', {}) or {}
+            for p in (Position.DST, Position.K, Position.QB, Position.RB, Position.TE, Position.WR):
+                val = float(exp_map.get(p, 0.0))
+                rnk = rnk_map.get(p, None)
+                if rnk is None:
+                    print(f"      * {p.value:>3s}: exp={val:7.2f}, r_p(a)=   -  ")
+                else:
+                    print(f"      * {p.value:>3s}: exp={val:7.2f}, r_p(a)={float(rnk):.2f}")
+
+    # Restore verbosity
+    engine.config.verbosity = prev_v
+
+
+def _print_roster(state: DraftState, pool: PlayerPool, team_idx: int) -> None:
+    r = state.rosters[team_idx]
+    print(f"\nTeam {team_idx} roster:")
+    by_pos: Dict[Position, List[str]] = {p: [] for p in Position}
+    for uid in r.players:
+        pl = pool.by_uid[uid]
+        by_pos[pl.position].append(f"{pl.name} ({pl.team or 'FA'})")
+    for p in (Position.QB, Position.RB, Position.WR, Position.TE, Position.DST, Position.K):
+        if by_pos[p]:
+            print(f"  {p.value}: " + ", ".join(by_pos[p]))
 
 
 # ==========================
-# ===== MAIN PROGRAM  ======
+# ======= MAIN LOOP  =======
 # ==========================
 
 def main():
-    # 1) Load pool
-    pool = load_player_pool_from_csv(CSV_PATH)
+    parser = argparse.ArgumentParser(description="Interactive live draft assistant.")
+    parser.add_argument("--csv", default=DEFAULT_CSV, help="Path to projections CSV")
+    parser.add_argument("--league-size", type=int, default=DEFAULT_LEAGUE_SIZE)
+    parser.add_argument("--rounds", type=int, default=DEFAULT_NUM_ROUNDS)
+    parser.add_argument("--my-team", type=int, required=True, help="Your team index (0-based)")
+    parser.add_argument("--trace", action="store_true", help="Force TRACE prints even when not your pick")
+    args = parser.parse_args()
 
-    # 2) Build config + state + engine
-    league = LeagueConfig(league_size=LEAGUE_SIZE, rules=ROSTER_RULES)
-    cfg = DraftEngineConfig(league=league, engine=ENGINE_PARAMS, verbosity=VERBOSITY)
+    # Load pool
+    pool = load_player_pool_from_csv(args.csv)
+
+    # League + config + state + engine
+    league = LeagueConfig(league_size=args.league_size, rules=DEFAULT_ROSTER_RULES)
+    cfg = DraftEngineConfig(league=league, engine=DEFAULT_ENGINE_PARAMS, verbosity=RUN_VERBOSITY)
     state = DraftState(league=league)
     engine = DraftEngine(config=cfg, pool=pool)
 
-    # 3) Apply manual picks (what already happened)
-    for pick_idx, sel in enumerate(MANUAL_PICKS, start=1):
-        # Ensure state.pick_number == pick_idx
-        if state.pick_number != pick_idx:
-            # Fast-forward if needed (shouldn't happen if you keep list contiguous)
-            state.pick_number = pick_idx
-        on_clock = state.team_on_the_clock()
-        uid = find_uid(pool,
-                       name=sel.get("name"),
-                       team=sel.get("team"),
-                       pos=sel.get("pos"),
-                       uid=sel.get("uid"))
-        if uid is None:
-            raise ValueError(f"Could not resolve player in MANUAL_PICKS at pick {pick_idx}: {sel}")
-        pl = pool.by_uid[uid]
-        # Apply
-        state.drafted_uids.add(uid)
-        state.rosters[on_clock].add(pl.position, uid)
-        if VERBOSITY >= Verbosity.PICKS:
-            print(f"{pick_idx:3d}. Team {on_clock} (manual) -> {pl.name} ({pl.position.value}, {pl.team or 'FA'})")
-        state.advance_one_pick()
+    total_picks = args.league_size * args.rounds
+    print(f"Live draft ready: {args.league_size} teams, {args.rounds} rounds ({total_picks} picks)")
+    print(f"Your team index: {args.my_team}\nType 'help' for commands.\n")
 
-    # 4) Show current draft pointer
-    on_clock = state.team_on_the_clock()
-    rnd = state.round_index() + 1
-    pos_in_round = state.index_in_round() + 1
-    print("\n=== Draft Status ===")
-    print(f"Pick #{state.pick_number}  (Round {rnd}, Pick {pos_in_round} in round)")
-    print(f"Team on the clock: {on_clock}")
+    # Track a simple pick history stack for 'undo'
+    history: List[Tuple[int, str]] = []  # (team_idx, uid)
 
-    # 5) If it's our turn, print RECOMMENDATION (without auto-picking)
-    if on_clock == MY_TEAM_INDEX:
-        # Use engine's internal evaluator to get best + top5 + breakdown
-        best, breakdown, top5 = engine._recommend_for_team(state, MY_TEAM_INDEX)  # type: ignore
+    while state.pick_number <= total_picks:
+        t_on_clock = state.team_on_the_clock()
+        pick_hdr = _team_on_clock_str(state, args.my_team)
+        print(f"\n=== {pick_hdr} ===")
 
-        if best is None:
-            print("No feasible candidates. (Check caps/gates and CSV columns.)")
-            return
+        # Optional: always show recommendations (TRACE) even when not your pick
+        if args.trace:
+            _print_recommendations(engine, state)
 
-        pl = pool.by_uid[best.uid]
-        print("\n=== Recommendation (do NOT auto-pick) ===")
-        print(
-            f"-> {pl.name} ({pl.position.value}, {pl.team or 'FA'})  "
-            f"[Δ_now={best.value_now:.2f}, Δ_next={best.exp_next:.2f}, "
-            f"U={best.utility:.2f}, ADP={best.adp if best.adp is not None else 'NA'}]"
-        )
+        # If it's your pick, auto-show recommendations
+        if t_on_clock == args.my_team and not args.trace:
+            _print_recommendations(engine, state)
 
-        print("\nTop 5 candidates:")
-        for r in top5:
+        # Prompt
+        who = "your" if t_on_clock == args.my_team else f"Team {t_on_clock}'s"
+        s = input(f"Enter {who} pick (name), or command: ").strip()
+
+        # Commands
+        if s.lower() in {"q", "quit", "exit"}:
+            print("Exiting without completing the draft.")
+            break
+
+        if s.lower() in {"h", "help"}:
             print(
-                f"   - {r.name:22s} {r.position.value:>3s}  "
-                f"Δ_now={r.value_now:7.2f}  Δ_next={r.exp_next:7.2f}  "
-                f"U={r.utility:7.2f}  ADP={r.adp if r.adp is not None else 'NA'}"
+                "\nCommands:\n"
+                "  help                Show this help\n"
+                "  board               Show last 12 picks\n"
+                "  roster [team]       Show roster for team (default: yours)\n"
+                "  mine                Show TRACE recommendations for your next pick (no state change)\n"
+                "  auto                Auto-pick (engine) for the team on the clock\n"
+                "  undo                Undo last pick you entered (one step)\n"
+                "  skip                Advance pick with no selection (debug only)\n"
+                "  quit                Exit immediately\n"
+                "Or type a player name to register the pick for the team on the clock.\n"
             )
+            continue
 
-        if breakdown:
-            print("\nNext-turn breakdown by position (conditioned on picking RECOMMENDED):")
-            for p in sorted(breakdown.exp_by_pos.keys(), key=lambda x: x.value):
-                val = breakdown.exp_by_pos[p]
-                rnk = breakdown.rank_by_pos[p]
-                print(f"   * {p.value:>3s}: exp={val:7.2f}, r_p(a)={rnk:.2f}")
+        if s.lower() == "board":
+            if not history:
+                print("(no picks yet)")
+            else:
+                print("\nLast picks:")
+                for team_idx, uid in history[-12:]:
+                    p = pool.by_uid[uid]
+                    print(f"  Team {team_idx}: {p.name} ({p.position.value}, {p.team or 'FA'})")
+            continue
 
-        # If you want to actually lock in the pick, uncomment:
-        # print("\nLocking in recommendation...")
-        # engine.make_pick(state)
+        if s.lower().startswith("roster"):
+            parts = s.split()
+            team = args.my_team
+            if len(parts) > 1 and parts[1].isdigit():
+                team = int(parts[1])
+            _print_roster(state, pool, team)
+            continue
 
+        if s.lower() == "mine":
+            _print_recommendations(engine, state)
+            continue
+
+        if s.lower() == "auto":
+            # Let engine pick for the team on the clock
+            prev = engine.config.verbosity
+            engine.config.verbosity = Verbosity.PICKS
+            row = engine.make_pick(state)
+            engine.config.verbosity = prev
+            if row is not None:
+                history.append((t_on_clock, row.uid))
+            continue
+
+        if s.lower() == "undo":
+            if not history:
+                print("Nothing to undo.")
+                continue
+            # Pop last pick
+            last_team, last_uid = history.pop()
+            print("Undoing last pick…")
+
+            # Rebuild state from scratch using the remaining history
+            state = DraftState(league=league)  # fresh rosters with proper ctor args
+            for team_idx, uid in history:
+                pl = pool.by_uid[uid]
+                state.drafted_uids.add(uid)
+                state.rosters[team_idx].add(pl.position, uid)
+                state.advance_one_pick()
+            continue
+
+        if s.lower() == "skip":
+            print("Skipping pick (no player) — debug only.")
+            state.advance_one_pick()
+            continue
+
+        # Otherwise: treat input as a player name
+        matches = _find_matches(pool, s)
+        # Filter out already drafted
+        matches = [m for m in matches if m.uid not in state.drafted_uids]
+
+        if not matches:
+            print("No available player matched that input.")
+            continue
+
+        player = _disambiguate(matches)
+        if player is None:
+            print("Cancelled.")
+            continue
+
+        # Apply pick to the team on the clock
+        _apply_pick(state, pool, t_on_clock, player)
+        history.append((t_on_clock, player.uid))
+
+    if state.pick_number > total_picks:
+        print("\nDraft complete. Good luck!")
     else:
-        # Not our turn; optionally print who is on the clock and suggest what THEY might do
-        print(f"\nIt is NOT your turn (your team index = {MY_TEAM_INDEX}).")
-        print("Add more MANUAL_PICKS to catch up to your turn, then re-run this script.")
-
-    # 6) Optional: print roster tallies for sanity
-    print("\n=== Roster tallies by team ===")
-    for t, r in enumerate(state.rosters):
-        print(f"Team {t}: {{"
-              + ", ".join([f"{p.value}: {r.count(p)}" for p in Position if r.count(p) > 0])
-              + "}}")
-
+        print("\nDraft ended early.")
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nInterrupted. Bye.")
+        sys.exit(0)

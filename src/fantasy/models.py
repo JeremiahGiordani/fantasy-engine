@@ -24,6 +24,7 @@ class Verbosity(IntEnum):
     QUIET = 0
     PICKS = 1
     DEBUG = 2
+    TRACE = 3
 
 
 class DistributionFamily(str, Enum):
