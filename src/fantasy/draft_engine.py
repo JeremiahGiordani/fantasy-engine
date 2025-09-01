@@ -289,7 +289,6 @@ def _aggregate_expected_removals(
 # -----------------------------
 # DraftEngine
 # -----------------------------
-
 @dataclass
 class DraftEngine:
     config: DraftEngineConfig
@@ -304,7 +303,8 @@ class DraftEngine:
         """
         team_idx = state.team_on_the_clock()
 
-        best_row, breakdown, top5, rows = self._recommend_for_team(state, team_idx)
+        # UPDATED: unpack TRACE payload too
+        best_row, breakdown, top5, rows, pos_cond_debug = self._recommend_for_team(state, team_idx)
         if best_row is None:
             if self.config.verbosity >= Verbosity.PICKS:
                 print(f"{state.pick_number:3d}. Team {team_idx} -> (no feasible candidates)")
@@ -339,7 +339,7 @@ class DraftEngine:
             for pos in (Position.QB, Position.RB, Position.WR, Position.TE):
                 if pos not in shown_positions:
                     best_pos = max((r for r in rows if r.position == pos),
-                                key=lambda r: r.utility, default=None)
+                                   key=lambda r: r.utility, default=None)
                     if best_pos:
                         print(
                             f"      - {best_pos.name:20s} {best_pos.position.value:>3s}  "
@@ -353,14 +353,31 @@ class DraftEngine:
                     rnk = breakdown.rank_by_pos[p]
                     print(f"      * {p.value:>3s}: exp={val:7.2f}, r_p(a)={rnk:.2f}")
 
+        # NEW: TRACE printing — conditioned next-turn breakdowns for the top player in each position
+        if getattr(Verbosity, "TRACE", 3) <= self.config.verbosity and pos_cond_debug:
+            print("    Next-turn breakdowns conditioned on picking the top player at each position:")
+            for pos in (Position.QB, Position.RB, Position.WR, Position.TE):
+                entry = pos_cond_debug.get(pos)
+                if not entry:
+                    continue
+                nm = entry['name']
+                print(f"    If pick {nm:20s} {pos.value:>3s}:")
+                exp_map = entry.get('exp_by_pos', {}) or {}
+                rnk_map = entry.get('rank_by_pos', {}) or {}
+                for p in (Position.DST, Position.K, Position.QB, Position.RB, Position.TE, Position.WR):
+                    val = float(exp_map.get(p, 0.0))
+                    rnk = rnk_map.get(p, None)
+                    if rnk is None:
+                        print(f"      * {p.value:>3s}: exp={val:7.2f}, r_p(a)=   -  ")
+                    else:
+                        print(f"      * {p.value:>3s}: exp={val:7.2f}, r_p(a)={float(rnk):.2f}")
+
         state.advance_one_pick()
         return best_row
-    
 
-        # -----------------------------
+    # -----------------------------
     # Simple roster-need weights (no VOR, no scarcity)
     # -----------------------------
-    
 
     def _adjust_next_turn_exp_for_flex(
         self,
@@ -418,25 +435,28 @@ class DraftEngine:
 
         return adjusted
 
-
     # ---------- Internals ----------
     def _recommend_for_team(
         self,
         state: DraftState,
         team_idx: int,
-    ) -> Tuple[Optional[CandidateRow], Optional[NextTurnBreakdown], List[CandidateRow], List[CandidateRow]]:
+    ) -> Tuple[
+        Optional[CandidateRow],
+        Optional[NextTurnBreakdown],
+        List[CandidateRow],
+        List[CandidateRow],
+        Optional[Dict[Position, Dict[str, object]]],  # NEW: per-position conditioned debug
+    ]:
         """
         Core evaluation:
-        - Non-corner: Utility = Δ_now(a) + (need-weighted expectation over positions)
-        - Corner    : Utility = Δ_now(a1) + best_immediate_second(a1) + weighted next-turn after the pair
-        where the next-turn component is computed with aggregate λ over the interval after our second pick.
-        DEBUG breakdown now shows **RAW** next-turn expectations: evaluated at r_raw = 1 + λ_p
-        using marginal lists built from the current state (no hypothetical pick applied).
-        Returns: (best_row, debug_breakdown, top5, rows)
+        - Non-corner: Utility = Δ_now(a) + sum_p exp_next_p(a)   [with your FLEX post-processing]
+        - Corner    : Utility = Δ_now(a1) + best_immediate_second(a1) + sum_p exp_next_p_after_pair(a1)
+        DEBUG breakdown shows RAW next-turn expectations at r_raw = 1 + λ_p (no hypothetical pick applied).
+        Returns: (best_row, debug_breakdown, top5, rows, pos_cond_debug)
         """
         candidates = self._feasible_candidates_for_team(state, team_idx)
         if not candidates:
-            return None, None, [], []
+            return None, None, [], [], None
 
         # Precompute Δ_now for speed (vectorized-ish)
         delta_now_map = value_now_for_candidates(
@@ -446,6 +466,9 @@ class DraftEngine:
         rows: List[CandidateRow] = []
         per_pos_debug_for_best: Optional[NextTurnBreakdown] = None
         best: Optional[CandidateRow] = None
+
+        # TRACE payload
+        pos_cond_debug: Optional[Dict[Position, Dict[str, object]]] = None
 
         # Small local helper: build RAW marginal lists (no pick applied) for top-k per position
         def _raw_marginals_for_current_state(per_pos_k: int) -> Dict[Position, List[float]]:
@@ -492,6 +515,7 @@ class DraftEngine:
 
             # Scoring loop for candidates (uses actual pair-aware weighted expectation)
             cand_buffer_corner: List[Tuple[int, Position, float, Dict[Position, float]]] = []
+            cand_post_rank_maps: Dict[int, Dict[Position, float]] = {}
 
             for pl in candidates:
                 dn = float(delta_now_map.get(pl.uid, 0.0))
@@ -521,15 +545,17 @@ class DraftEngine:
 
                 # Next-turn *after the pair*
                 post_exp_by_pos: Dict[Position, float] = {}
+                post_rank_by_pos: Dict[Position, float] = {}
                 for p, vals in m_by_pos.items():
                     rp_post = 1.0 + (1.0 if p == p2_star else 0.0) + float(lam_post.get(p, 0.0))
+                    post_rank_by_pos[p] = rp_post
                     post_exp_by_pos[p] = interpolate_at_rank(vals, rp_post) if vals else 0.0
 
-                # Buffer for post-processing
+                # Buffer for post-processing and TRACE ranks
+                cand_post_rank_maps[pl.uid] = post_rank_by_pos
                 cand_buffer_corner.append((pl.uid, pl.position, dn + d2_immediate, post_exp_by_pos))
 
             # Post-process post-pair maps (collapse FLEX optionality for non-FLEX first-pick types)
-            # We pass dn+d2_immediate as "now" to select the best FLEX anchor sensibly for the pair.
             adjusted_corner_maps = self._adjust_next_turn_exp_for_flex(state, team_idx, cand_buffer_corner)
 
             # Score rows using adjusted post-pair maps
@@ -578,11 +604,27 @@ class DraftEngine:
                 if (best is None) or (row.utility > best.utility):
                     best = row
 
+            # TRACE payload for corner: top candidate per position with adjusted post-pair maps + ranks
+            if getattr(Verbosity, "TRACE", 3) <= self.config.verbosity:
+                pos_cond_debug = {}
+                for pos in (Position.QB, Position.RB, Position.WR, Position.TE):
+                    best_pos = max((r for r in rows if r.position == pos),
+                                   key=lambda r: r.utility, default=None)
+                    if not best_pos:
+                        continue
+                    uid = best_pos.uid
+                    pos_cond_debug[pos] = {
+                        'uid': uid,
+                        'name': best_pos.name,
+                        'exp_by_pos': adjusted_corner_maps.get(uid, {}),
+                        'rank_by_pos': cand_post_rank_maps.get(uid, {}),
+                    }
+
             rows.sort(key=lambda r: r.utility, reverse=True)
             top5 = rows[:5]
-            return best, per_pos_debug_for_best, top5, rows
+            return best, per_pos_debug_for_best, top5, rows, pos_cond_debug
 
-        # ----- Non-corner: one-step lookahead with weighted expectation -----
+        # ----- Non-corner: one-step lookahead with simple sum (plus FLEX post-processing) -----
         lam = self._expected_removals_between_our_picks(state, team_idx)
 
         # --- DEBUG RAW breakdown (non-corner): build raw lists from current state, no pick applied
@@ -600,8 +642,9 @@ class DraftEngine:
                 exp_by_pos=raw_exp_by_pos, rank_by_pos=raw_rank_by_pos
             )
 
-        # Scoring loop (uses hypothetical a added because Term-2 needs post-a ranks)
+        # Scoring loop (collect per-candidate info first)
         cand_buffer: List[Tuple[int, Position, float, Dict[Position, float]]] = []
+        cand_rank_maps: Dict[int, Dict[Position, float]] = {}
 
         for pl in candidates:
             dn = float(delta_now_map.get(pl.uid, 0.0))
@@ -617,13 +660,16 @@ class DraftEngine:
             )
 
             exp_by_pos: Dict[Position, float] = {}
+            rank_by_pos_this: Dict[Position, float] = {}
             for p, vals in m_by_pos.items():
                 rp = 1.0 + (1.0 if p == pl.position else 0.0) + lam.get(p, 0.0)
+                rank_by_pos_this[p] = rp
                 exp_by_pos[p] = interpolate_at_rank(vals, rp) if vals else 0.0
 
+            cand_rank_maps[pl.uid] = rank_by_pos_this
             cand_buffer.append((pl.uid, pl.position, dn, exp_by_pos))
 
-        # --- NEW: Post-process next-turn maps to collapse FLEX optionality for non-FLEX candidates
+        # Post-process next-turn maps to collapse FLEX optionality for non-FLEX candidates
         adjusted_maps = self._adjust_next_turn_exp_for_flex(state, team_idx, cand_buffer)
 
         # Now score with the adjusted maps (simple SUM, per your original good behavior)
@@ -650,11 +696,25 @@ class DraftEngine:
             if (best is None) or (row.utility > best.utility):
                 best = row
 
+        # TRACE payload for non-corner: top candidate per position with adjusted maps + ranks
+        if getattr(Verbosity, "TRACE", 3) <= self.config.verbosity:
+            pos_cond_debug = {}
+            for pos in (Position.QB, Position.RB, Position.WR, Position.TE):
+                best_pos = max((r for r in rows if r.position == pos),
+                               key=lambda r: r.utility, default=None)
+                if not best_pos:
+                    continue
+                uid = best_pos.uid
+                pos_cond_debug[pos] = {
+                    'uid': uid,
+                    'name': best_pos.name,
+                    'exp_by_pos': adjusted_maps.get(uid, {}),
+                    'rank_by_pos': cand_rank_maps.get(uid, {}),
+                }
+
         rows.sort(key=lambda r: r.utility, reverse=True)
         top5 = rows[:5]
-        return best, per_pos_debug_for_best, top5, rows
-
-
+        return best, per_pos_debug_for_best, top5, rows, pos_cond_debug
 
     def _feasible_candidates_for_team(self, state: DraftState, team_idx: int) -> List:
         """
@@ -791,8 +851,6 @@ class DraftEngine:
 
         # If still empty (very unlikely), just return what we have
         return selected
-
-
 
     def _expected_removals_between_our_picks(self, state: DraftState, team_idx: int) -> Dict[Position, float]:
         """
