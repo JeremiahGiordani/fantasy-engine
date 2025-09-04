@@ -1,36 +1,35 @@
 # live_draft.py
 """
-Interactive live draft assistant using DraftEngine.
+Interactive live draft assistant using DraftEngine, with crash-safe resume.
 
-What this does
---------------
-- Loads a projections CSV into a PlayerPool
-- Builds a league + engine config (same knobs you used for mock)
-- Runs an interactive snake draft where you:
-    * Type the real-life player picked for each team
-    * When it's YOUR pick, it shows full recommendations (TRACE)
-      and lets you choose your player (or auto-pick best)
-- Prints a running "board" of picks and supports simple commands
+New features
+------------
+- --save-log PATH   : append each pick to a JSON-lines log (crash safe)
+- --resume-log PATH : rebuild state from a JSON-lines log before starting
+- 'undo' rewrites the log so it stays consistent with history
+
+Log format (NDJSON)
+-------------------
+One JSON object per line, e.g.:
+{"pick_number": 17, "team_idx": 2, "uid": "Bijan Robinson|ATL|RB",
+ "name": "Bijan Robinson", "position": "RB", "team": "ATL", "ts": "2025-09-01T18:03:44Z"}
 
 How to use
----------
-1) Set CSV_PATH or pass --csv on the CLI (defaults provided).
-2) Run:  python live_draft.py --my-team 0  (or whichever team index is yours)
-3) Follow the prompts. Type a player's name to register the pick.
-   Commands: help, board, roster [team], mine, auto, undo, skip, quit
-
-Notes
------
-- Player lookup is by name (case-insensitive); if ambiguous, you’ll be asked to disambiguate.
-- For your pick, we show full TRACE recommendations *before* you draft.
-- For others' picks, we simply record who they took. You can also type 'auto' to let the bot pick.
+----------
+1) Run with your params:
+   python live_draft.py --my-team 0 --csv data/projections_2025_wk0.csv --league-size 10 --rounds 16 --save-log draft_log.ndjson
+2) If you crash mid-draft, restart with:
+   python live_draft.py --my-team 0 --csv data/projections_2025_wk0.csv --league-size 10 --rounds 16 --resume-log draft_log.ndjson --save-log draft_log.ndjson
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
+import json
+import os
 import sys
+from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 
 from fantasy.models import (
@@ -55,7 +54,7 @@ from src.fantasy.draft_engine import DraftEngine
 # ==========================
 
 DEFAULT_CSV = "data/projections_2025_wk0.csv"
-DEFAULT_LEAGUE_SIZE = 5
+DEFAULT_LEAGUE_SIZE = 10
 DEFAULT_NUM_ROUNDS = 16
 
 DEFAULT_ROSTER_RULES = RosterRules(
@@ -78,8 +77,7 @@ DEFAULT_ENGINE_PARAMS = EngineParams(
     value_model=ValueModelParams(use_vor=False),
 )
 
-# Verbosity: we’ll always print at TRACE when showing recommendations
-RUN_VERBOSITY = Verbosity.PICKS  # general chatter
+RUN_VERBOSITY = Verbosity.PICKS  # general console verbosity
 
 
 # ==========================
@@ -150,6 +148,89 @@ def load_player_pool_from_csv(path: str) -> PlayerPool:
 
 
 # ==========================
+# ===== LOGGING UTILS ======
+# ==========================
+
+def _ensure_parent_dir(path: str) -> None:
+    d = os.path.dirname(os.path.abspath(path))
+    if d and not os.path.exists(d):
+        os.makedirs(d, exist_ok=True)
+
+def _append_pick_to_log(save_path: Optional[str], record: Dict) -> None:
+    if not save_path:
+        return
+    _ensure_parent_dir(save_path)
+    # append one JSON line and flush
+    with open(save_path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record, separators=(",", ":")) + "\n")
+
+def _rewrite_log_from_history(save_path: Optional[str], history: List[Tuple[int, str]], pool: PlayerPool) -> None:
+    if not save_path:
+        return
+    _ensure_parent_dir(save_path)
+    with open(save_path, "w", encoding="utf-8") as f:
+        for idx, (team_idx, uid) in enumerate(history, start=1):
+            p = pool.by_uid.get(uid)
+            if not p:
+                continue
+            rec = {
+                "pick_number": idx,
+                "team_idx": team_idx,
+                "uid": p.uid,
+                "name": p.name,
+                "position": p.position.value,
+                "team": p.team,
+                "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            }
+            f.write(json.dumps(rec, separators=(",", ":")) + "\n")
+
+def _load_history_from_log(resume_path: str, pool: PlayerPool, league_size: int) -> List[Tuple[int, str]]:
+    """
+    Returns history as list[(team_idx, uid)] by reading and validating the log.
+    If a uid in the log isn't present in the pool (e.g., CSV changes), we try to
+    resolve via (name, position, team); otherwise we skip that line with a warning.
+    """
+    hist: List[Tuple[int, str]] = []
+    if not resume_path or not os.path.exists(resume_path):
+        return hist
+
+    def _resolve_uid(rec: Dict) -> Optional[str]:
+        uid = rec.get("uid")
+        if uid and uid in pool.by_uid:
+            return uid
+        # Try to reconstruct uid from fields we stored
+        nm = rec.get("name")
+        tm = rec.get("team") or "FA"
+        pos = rec.get("position")
+        if nm and pos:
+            guess = f"{nm}|{tm}|{pos}"
+            if guess in pool.by_uid:
+                return guess
+        # Fallback: fuzzy by name+pos
+        matches = [u for u, p in pool.by_uid.items()
+                   if p.name == nm and p.position.value == (pos or "")]
+        return matches[0] if matches else None
+
+    with open(resume_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except Exception:
+                continue
+            team_idx = rec.get("team_idx")
+            uid = _resolve_uid(rec)
+            pick_no = rec.get("pick_number")
+            # quick sanity: team idx must match pick slot modulo snake; we don't hard-enforce here
+            if team_idx is None or uid is None:
+                continue
+            hist.append((int(team_idx), uid))
+    return hist
+
+
+# ==========================
 # ===== HELPER UTILS  ======
 # ==========================
 
@@ -158,16 +239,12 @@ def _team_on_clock_str(state: DraftState, my_team: int) -> str:
     me = " (YOU)" if t == my_team else ""
     return f"Pick {state.pick_number:3d} — Team {t}{me}"
 
-
 def _find_matches(pool: PlayerPool, query: str) -> List[Player]:
     q = query.strip().lower()
-    # First try exact name match
     exact = [p for p in pool.by_uid.values() if p.name.lower() == q]
     if exact:
         return exact
-    # Else substring
     return [p for p in pool.by_uid.values() if q in p.name.lower()]
-
 
 def _disambiguate(matches: List[Player]) -> Optional[Player]:
     if not matches:
@@ -188,38 +265,41 @@ def _disambiguate(matches: List[Player]) -> Optional[Player]:
                 return matches[k - 1]
         print("Invalid selection.")
 
+def _apply_pick(state: DraftState, pool: PlayerPool, team_idx: int, player: Player,
+                save_path: Optional[str], history: List[Tuple[int, str]]) -> None:
+    # Log BEFORE advancing (use current pick number)
+    rec = {
+        "pick_number": state.pick_number,
+        "team_idx": team_idx,
+        "uid": player.uid,
+        "name": player.name,
+        "position": player.position.value,
+        "team": player.team,
+        "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+    _append_pick_to_log(save_path, rec)
 
-def _apply_pick(state: DraftState, pool: PlayerPool, team_idx: int, player: Player) -> None:
+    # Apply to state
     state.drafted_uids.add(player.uid)
     state.rosters[team_idx].add(player.position, player.uid)
     state.advance_one_pick()
 
-
-def _undo_last_pick(state: DraftState) -> bool:
-    # Assumes DraftState remembers pick order? If not, we keep our own stack in main.
-    return False  # we’ll manage undo using our own stack in the script
-
+    # Push to in-memory history
+    history.append((team_idx, player.uid))
 
 def _print_recommendations(engine: DraftEngine, state: DraftState) -> None:
-    """
-    Print full TRACE-style recommendations for the team currently on the clock,
-    without mutating state.
-    """
     team_idx = state.team_on_the_clock()
-    # Temporarily raise verbosity to TRACE for printing
     prev_v = engine.config.verbosity
     engine.config.verbosity = getattr(Verbosity, "TRACE", 3)
 
     best_row, breakdown, top5, rows, pos_cond_debug = engine._recommend_for_team(state, team_idx)
 
-    # Mirror the printing logic from DraftEngine.make_pick (but do NOT pick)
     print(f"\n{_team_on_clock_str(state, team_idx)} — RECOMMENDATIONS (TRACE):")
     if not rows:
         print("  (no feasible candidates)")
         engine.config.verbosity = prev_v
         return
 
-    # Top candidates table
     print("    Top candidates:")
     for r in rows[:5]:
         print(
@@ -264,9 +344,7 @@ def _print_recommendations(engine: DraftEngine, state: DraftState) -> None:
                 else:
                     print(f"      * {p.value:>3s}: exp={val:7.2f}, r_p(a)={float(rnk):.2f}")
 
-    # Restore verbosity
     engine.config.verbosity = prev_v
-
 
 def _print_roster(state: DraftState, pool: PlayerPool, team_idx: int) -> None:
     r = state.rosters[team_idx]
@@ -285,12 +363,14 @@ def _print_roster(state: DraftState, pool: PlayerPool, team_idx: int) -> None:
 # ==========================
 
 def main():
-    parser = argparse.ArgumentParser(description="Interactive live draft assistant.")
+    parser = argparse.ArgumentParser(description="Interactive live draft assistant (crash-safe).")
     parser.add_argument("--csv", default=DEFAULT_CSV, help="Path to projections CSV")
     parser.add_argument("--league-size", type=int, default=DEFAULT_LEAGUE_SIZE)
     parser.add_argument("--rounds", type=int, default=DEFAULT_NUM_ROUNDS)
     parser.add_argument("--my-team", type=int, required=True, help="Your team index (0-based)")
     parser.add_argument("--trace", action="store_true", help="Force TRACE prints even when not your pick")
+    parser.add_argument("--save-log", default=None, help="Path to JSON-lines log for appending picks")
+    parser.add_argument("--resume-log", default=None, help="Path to JSON-lines log to resume from")
     args = parser.parse_args()
 
     # Load pool
@@ -302,12 +382,28 @@ def main():
     state = DraftState(league=league)
     engine = DraftEngine(config=cfg, pool=pool)
 
+    # Pick history in memory: list of (team_idx, uid)
+    history: List[Tuple[int, str]] = []
+
+    # Resume from log if provided
+    if args.resume_log and os.path.exists(args.resume_log):
+        print(f"Resuming from log: {args.resume_log}")
+        history = _load_history_from_log(args.resume_log, pool, args.league_size)
+        # Rebuild state by replaying history
+        state = DraftState(league=league)
+        for team_idx, uid in history:
+            pl = pool.by_uid.get(uid)
+            if not pl:
+                continue
+            state.drafted_uids.add(uid)
+            state.rosters[team_idx].add(pl.position, uid)
+            state.advance_one_pick()
+        print(f"Applied {len(history)} picks from log. Next on clock: Team {state.team_on_the_clock()} (Pick {state.pick_number}).")
+
+    # If resuming into the same log we will also append to, ensure no partial line issues (handled by 'a' mode)
     total_picks = args.league_size * args.rounds
     print(f"Live draft ready: {args.league_size} teams, {args.rounds} rounds ({total_picks} picks)")
     print(f"Your team index: {args.my_team}\nType 'help' for commands.\n")
-
-    # Track a simple pick history stack for 'undo'
-    history: List[Tuple[int, str]] = []  # (team_idx, uid)
 
     while state.pick_number <= total_picks:
         t_on_clock = state.team_on_the_clock()
@@ -327,11 +423,12 @@ def main():
         s = input(f"Enter {who} pick (name), or command: ").strip()
 
         # Commands
-        if s.lower() in {"q", "quit", "exit"}:
+        cmd = s.lower()
+        if cmd in {"q", "quit", "exit"}:
             print("Exiting without completing the draft.")
             break
 
-        if s.lower() in {"h", "help"}:
+        if cmd in {"h", "help"}:
             print(
                 "\nCommands:\n"
                 "  help                Show this help\n"
@@ -340,13 +437,13 @@ def main():
                 "  mine                Show TRACE recommendations for your next pick (no state change)\n"
                 "  auto                Auto-pick (engine) for the team on the clock\n"
                 "  undo                Undo last pick you entered (one step)\n"
-                "  skip                Advance pick with no selection (debug only)\n"
+                "  skip                Advance pick with no selection (debug only; not logged)\n"
                 "  quit                Exit immediately\n"
                 "Or type a player name to register the pick for the team on the clock.\n"
             )
             continue
 
-        if s.lower() == "board":
+        if cmd == "board":
             if not history:
                 print("(no picks yet)")
             else:
@@ -356,7 +453,7 @@ def main():
                     print(f"  Team {team_idx}: {p.name} ({p.position.value}, {p.team or 'FA'})")
             continue
 
-        if s.lower().startswith("roster"):
+        if cmd.startswith("roster"):
             parts = s.split()
             team = args.my_team
             if len(parts) > 1 and parts[1].isdigit():
@@ -364,45 +461,50 @@ def main():
             _print_roster(state, pool, team)
             continue
 
-        if s.lower() == "mine":
+        if cmd == "mine":
             _print_recommendations(engine, state)
             continue
 
-        if s.lower() == "auto":
+        if cmd == "auto":
             # Let engine pick for the team on the clock
             prev = engine.config.verbosity
-            engine.config.verbosity = Verbosity.PICKS
-            row = engine.make_pick(state)
+            engine.config.verbosity = Verbosity.TRACE
+            team_before = t_on_clock
+            row = engine._recommend_for_team(state, t_on_clock)[0]  # peek best
             engine.config.verbosity = prev
-            if row is not None:
-                history.append((t_on_clock, row.uid))
+            if row is None:
+                print("(no feasible candidates)")
+                continue
+            player = pool.by_uid[row.uid]
+            _apply_pick(state, pool, team_before, player, args.save_log, history)
+            print(f"Auto-picked: {player.name} ({player.position.value}, {player.team or 'FA'})")
             continue
 
-        if s.lower() == "undo":
+        if cmd == "undo":
             if not history:
                 print("Nothing to undo.")
                 continue
-            # Pop last pick
-            last_team, last_uid = history.pop()
             print("Undoing last pick…")
-
-            # Rebuild state from scratch using the remaining history
-            state = DraftState(league=league)  # fresh rosters with proper ctor args
+            # Remove last pick from in-memory history
+            history.pop()
+            # Rebuild state from scratch
+            state = DraftState(league=league)
             for team_idx, uid in history:
                 pl = pool.by_uid[uid]
                 state.drafted_uids.add(uid)
                 state.rosters[team_idx].add(pl.position, uid)
                 state.advance_one_pick()
+            # Rewrite log to match history
+            _rewrite_log_from_history(args.save_log or args.resume_log, history, pool)
             continue
 
-        if s.lower() == "skip":
-            print("Skipping pick (no player) — debug only.")
+        if cmd == "skip":
+            print("Skipping pick (no player) — debug only (not logged).")
             state.advance_one_pick()
             continue
 
         # Otherwise: treat input as a player name
         matches = _find_matches(pool, s)
-        # Filter out already drafted
         matches = [m for m in matches if m.uid not in state.drafted_uids]
 
         if not matches:
@@ -414,9 +516,8 @@ def main():
             print("Cancelled.")
             continue
 
-        # Apply pick to the team on the clock
-        _apply_pick(state, pool, t_on_clock, player)
-        history.append((t_on_clock, player.uid))
+        # Apply and log the pick
+        _apply_pick(state, pool, t_on_clock, player, args.save_log, history)
 
     if state.pick_number > total_picks:
         print("\nDraft complete. Good luck!")
